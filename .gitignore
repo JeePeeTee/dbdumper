@@ -1,0 +1,12 @@
+# Build output
+/bin/
+/tmp/
+*.exe
+
+# Dump archives. These contain real database contents and must never be
+# committed, wherever they happen to be written.
+*.dbdump
+
+# Markdown preview artefacts produced by some editors
+0README.html
+*.md.html
