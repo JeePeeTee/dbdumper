@@ -566,10 +566,122 @@ ORDER BY o.type, s.name, o.name`)
 		return nil, err
 	}
 
+	out, err = in.pruneModulesReferencingExcluded(ctx, out)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := orderModulesByDependency(ctx, in.DB, out); err != nil {
 		in.warn("could not resolve module dependencies (%v); falling back to retry ordering", err)
 	}
 	return out, nil
+}
+
+// pruneModulesReferencingExcluded drops views, functions and procedures that
+// depend on a table --include or --exclude left out of the dump.
+//
+// Keeping them produces an archive that cannot be restored: CREATE VIEW fails
+// with "Invalid object name" and the import aborts. Removal is transitive,
+// since a view built on a dropped view is equally unusable.
+func (in *Introspector) pruneModulesReferencingExcluded(ctx context.Context, mods []model.Module) ([]model.Module, error) {
+	if in.Filter == nil || len(mods) == 0 {
+		return mods, nil
+	}
+
+	// Which tables the filter left out. Anything not a table in this database
+	// - a system view, a type - is not our concern and must not trigger a drop.
+	rows, err := in.DB.QueryContext(ctx, `
+SELECT s.name, t.name
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE t.is_ms_shipped = 0 AND t.type = 'U'`)
+	if err != nil {
+		return nil, fmt.Errorf("read table list for module pruning: %w", err)
+	}
+	excluded := map[string]bool{}
+	for rows.Next() {
+		var schema, name string
+		if err := rows.Scan(&schema, &name); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if !in.keep(schema, name) {
+			excluded[strings.ToLower(schema+"."+name)] = true
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(excluded) == 0 {
+		return mods, nil
+	}
+
+	deps, err := moduleDependencies(ctx, in.DB)
+	if err != nil {
+		// Without the dependency graph the safe choice is to keep everything
+		// and let the importer's retry-then-report handle the fallout.
+		in.warn("could not read module dependencies (%v); modules referencing excluded tables may fail on restore", err)
+		return mods, nil
+	}
+
+	// Fixed point: a module goes when it references anything already gone.
+	dropped := map[string]bool{}
+	for changed := true; changed; {
+		changed = false
+		for _, m := range mods {
+			key := strings.ToLower(m.Schema + "." + m.Name)
+			if dropped[key] {
+				continue
+			}
+			for _, ref := range deps[key] {
+				if excluded[ref] || dropped[ref] {
+					dropped[key] = true
+					changed = true
+					in.warn("skipping %s %s.%s: it references %s, which is not in this dump",
+						m.Kind, m.Schema, m.Name, ref)
+					break
+				}
+			}
+		}
+	}
+	if len(dropped) == 0 {
+		return mods, nil
+	}
+
+	kept := mods[:0]
+	for _, m := range mods {
+		if !dropped[strings.ToLower(m.Schema+"."+m.Name)] {
+			kept = append(kept, m)
+		}
+	}
+	return kept, nil
+}
+
+// moduleDependencies maps each module to the lower-cased "schema.name" of every
+// entity it references.
+func moduleDependencies(ctx context.Context, db *sql.DB) (map[string][]string, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT DISTINCT ss.name, so.name, ISNULL(d.referenced_schema_name, SCHEMA_NAME()), d.referenced_entity_name
+FROM sys.sql_expression_dependencies d
+JOIN sys.objects so ON so.object_id = d.referencing_id
+JOIN sys.schemas ss ON ss.schema_id = so.schema_id
+WHERE d.referenced_entity_name IS NOT NULL AND d.is_ambiguous = 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string][]string{}
+	for rows.Next() {
+		var fromSchema, fromName, toSchema, toName string
+		if err := rows.Scan(&fromSchema, &fromName, &toSchema, &toName); err != nil {
+			return nil, err
+		}
+		from := strings.ToLower(fromSchema + "." + fromName)
+		out[from] = append(out[from], strings.ToLower(toSchema+"."+toName))
+	}
+	return out, rows.Err()
 }
 
 // orderModulesByDependency topologically sorts modules so that a view or
