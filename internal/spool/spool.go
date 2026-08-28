@@ -35,9 +35,9 @@ type Meta struct {
 	StartedAt     time.Time `json:"startedAt"`
 	Server        string    `json:"server"`
 	Database      string    `json:"database"`
-	// Fingerprint covers the source schema. A resume against a database whose
-	// shape has changed would mix rows read before the change with rows read
-	// after it, so it is refused.
+	// Fingerprint covers the source schema and the row filters in force. A
+	// resume against a database whose shape has changed, or under a different
+	// --where, would mix rows selected two different ways, so it is refused.
 	Fingerprint string `json:"fingerprint"`
 }
 
@@ -108,7 +108,7 @@ func Resume(dir string, want Meta) (*Spool, error) {
 		return nil, fmt.Errorf("the interrupted export in %s is of database %q, not %q; use --restart",
 			dir, have.Database, want.Database)
 	case have.Fingerprint != want.Fingerprint:
-		return nil, fmt.Errorf("the schema of %q has changed since the interrupted export in %s was started; use --restart",
+		return nil, fmt.Errorf("%q no longer matches the interrupted export in %s: its schema has changed, or the --where filters differ from the ones that run used; use --restart",
 			want.Database, dir)
 	}
 	return &Spool{dir: dir}, nil
