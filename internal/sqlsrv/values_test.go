@@ -230,3 +230,74 @@ func TestTableFilter(t *testing.T) {
 		t.Error("an empty filter should be nil so callers can skip it")
 	}
 }
+
+func TestEnsurePacketSize(t *testing.T) {
+	cases := []struct {
+		name string
+		in   ConnConfig
+		want string // substring the resulting DSN must contain
+		deny string
+	}{
+		{
+			name: "ADO DSN without one gets the default",
+			in:   ConnConfig{DSN: `server=host;database=x`},
+			want: "packet size=32767",
+		},
+		{
+			name: "URL DSN without one gets the default",
+			in:   ConnConfig{DSN: "sqlserver://host?database=x"},
+			want: "packet+size=32767",
+		},
+		{
+			name: "a packet size already in the DSN wins",
+			in:   ConnConfig{DSN: `server=host;packet size=4096`},
+			want: "packet size=4096",
+			deny: "32767",
+		},
+		{
+			name: "case-insensitive match on the existing key",
+			in:   ConnConfig{DSN: `server=host;Packet Size=8192`},
+			want: "Packet Size=8192",
+			deny: "32767",
+		},
+		{
+			name: "an explicit flag value is used instead of the default",
+			in:   ConnConfig{DSN: `server=host`, PacketSize: 512},
+			want: "packet size=512",
+		},
+		{
+			name: "-1 means leave the driver alone",
+			in:   ConnConfig{DSN: `server=host`, PacketSize: -1},
+			deny: "packet size",
+		},
+	}
+	for _, c := range cases {
+		got := c.in.EnsurePacketSize().String()
+		if c.want != "" && !strings.Contains(got, c.want) {
+			t.Errorf("%s: %q missing from %q", c.name, c.want, got)
+		}
+		if c.deny != "" && strings.Contains(got, c.deny) {
+			t.Errorf("%s: %q should not appear in %q", c.name, c.deny, got)
+		}
+	}
+
+	// Without a DSN the discrete builder already handles it; nothing to add.
+	if got := (ConnConfig{Server: "host"}).EnsurePacketSize().DSN; got != "" {
+		t.Errorf("EnsurePacketSize invented a DSN: %q", got)
+	}
+}
+
+// TestWithDatabaseKeepsOtherParams guards the ADO rewrite used by both
+// WithDatabase and EnsurePacketSize against dropping unrelated settings.
+func TestWithDatabaseKeepsOtherParams(t *testing.T) {
+	got := (ConnConfig{DSN: `server=host;Initial Catalog=old;trusted_connection=true;protocol=lpc`}).
+		WithDatabase("new").String()
+	for _, want := range []string{"server=host", "trusted_connection=true", "protocol=lpc", "database=new"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("%q missing from %q", want, got)
+		}
+	}
+	if strings.Contains(strings.ToLower(got), "old") {
+		t.Errorf("old catalog survived: %q", got)
+	}
+}

@@ -86,7 +86,8 @@ Connection flags (both export and import):
   --trust-cert    accept a self-signed server certificate
   --protocol      pin transport: tcp | np (named pipes) | lpc (shared memory)
   --packet-size   TDS packet size 512..32767 (default 32767; -1 = driver default)
-  --dsn           full connection string; overrides all of the above
+  --dsn           full connection string; overrides the above except
+                  --database and --packet-size
 
 Run "dbdumper export -h" or "dbdumper import -h" for the rest.
 `)
@@ -95,7 +96,7 @@ Run "dbdumper export -h" or "dbdumper import -h" for the rest.
 // connFlags registers the shared connection flags on fs.
 func connFlags(fs *flag.FlagSet) *sqlsrv.ConnConfig {
 	c := &sqlsrv.ConnConfig{AppName: "dbdumper"}
-	fs.StringVar(&c.DSN, "dsn", "", "full connection string (overrides the other connection flags, except --database)")
+	fs.StringVar(&c.DSN, "dsn", "", "full connection string (overrides the other connection flags, except --database and --packet-size)")
 	fs.StringVar(&c.Server, "server", "localhost", `server: host, host\instance or host,port`)
 	fs.IntVar(&c.Port, "port", 0, "TCP port (default: instance default)")
 	fs.StringVar(&c.Database, "database", "", "database name; with --dsn, overrides the database in it")
@@ -142,6 +143,7 @@ func finishConn(fs *flag.FlagSet, c *sqlsrv.ConnConfig) error {
 	if c.DSN != "" && c.Database != "" {
 		*c = c.WithDatabase(c.Database)
 	}
+	*c = c.EnsurePacketSize()
 
 	// Azure SQL mandates encryption and presents a certificate that chains to
 	// a public root, so the local-server defaults are wrong in both directions.

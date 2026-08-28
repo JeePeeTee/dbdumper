@@ -190,20 +190,71 @@ func (c ConnConfig) WithDatabase(name string) ConnConfig {
 		c.DSN = u.String()
 		return c
 	}
-	// ADO style "key=value;key=value".
-	parts := strings.Split(c.DSN, ";")
+	c.DSN = setADOParam(c.DSN, "database", name, "initial catalog")
+	return c
+}
+
+// EnsurePacketSize adds a TDS packet size to a DSN that does not already name
+// one. A --dsn is otherwise taken verbatim, but this flag has a default the
+// tool chose rather than the user, and it is exactly the DSN users on a
+// high-latency link who need it: silently leaving them on the driver's 4096
+// bytes contradicts what --help says the default is. A packet size already in
+// the DSN always wins.
+func (c ConnConfig) EnsurePacketSize() ConnConfig {
+	size := c.PacketSize
+	if size == 0 {
+		size = DefaultPacketSize
+	}
+	if c.DSN == "" || size < 0 || dsnHasParam(c.DSN, "packet size") {
+		return c
+	}
+	if u, err := url.Parse(c.DSN); err == nil && u.Scheme == "sqlserver" {
+		q := u.Query()
+		q.Set("packet size", strconv.Itoa(size))
+		u.RawQuery = q.Encode()
+		c.DSN = u.String()
+		return c
+	}
+	c.DSN = setADOParam(c.DSN, "packet size", strconv.Itoa(size))
+	return c
+}
+
+// dsnHasParam reports whether an ADO-style or URL DSN already sets key.
+func dsnHasParam(dsn, key string) bool {
+	if u, err := url.Parse(dsn); err == nil && u.Scheme == "sqlserver" {
+		_, ok := u.Query()[key]
+		return ok
+	}
+	for _, p := range strings.Split(dsn, ";") {
+		k, _, ok := strings.Cut(p, "=")
+		if ok && strings.EqualFold(strings.TrimSpace(k), key) {
+			return true
+		}
+	}
+	return false
+}
+
+// setADOParam replaces key in an ADO-style "key=value;..." string, dropping any
+// of its aliases on the way.
+func setADOParam(dsn, key, value string, aliases ...string) string {
+	drop := append([]string{key}, aliases...)
+	parts := strings.Split(dsn, ";")
 	out := parts[:0]
 	for _, p := range parts {
 		k := strings.ToLower(strings.TrimSpace(strings.SplitN(p, "=", 2)[0]))
-		if k == "database" || k == "initial catalog" {
+		skip := false
+		for _, d := range drop {
+			if k == d {
+				skip = true
+				break
+			}
+		}
+		if skip || strings.TrimSpace(p) == "" {
 			continue
 		}
-		if strings.TrimSpace(p) != "" {
-			out = append(out, p)
-		}
+		out = append(out, p)
 	}
-	c.DSN = strings.Join(append(out, "database="+name), ";")
-	return c
+	return strings.Join(append(out, key+"="+value), ";")
 }
 
 // DatabaseName reports the database this config points at, if it can tell.
