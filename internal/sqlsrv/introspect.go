@@ -268,7 +268,7 @@ ORDER BY s.name, t.name`)
 // scan every table twice.
 func (in *Introspector) loadRowEstimates(ctx context.Context, tables []model.Table) error {
 	rows, err := in.DB.QueryContext(ctx, `
-SELECT s.name, t.name, SUM(ps.row_count)
+SELECT s.name, t.name, SUM(ps.row_count), SUM(ps.used_page_count) * 8192
 FROM sys.dm_db_partition_stats ps
 JOIN sys.tables t   ON t.object_id = ps.object_id
 JOIN sys.schemas s  ON s.schema_id = t.schema_id
@@ -279,20 +279,22 @@ GROUP BY s.name, t.name`)
 	}
 	defer rows.Close()
 
-	est := map[string]int64{}
+	type estimate struct{ rows, bytes int64 }
+	est := map[string]estimate{}
 	for rows.Next() {
 		var schema, name string
-		var n int64
-		if err := rows.Scan(&schema, &name, &n); err != nil {
+		var e estimate
+		if err := rows.Scan(&schema, &name, &e.rows, &e.bytes); err != nil {
 			return err
 		}
-		est[strings.ToLower(schema+"."+name)] = n
+		est[strings.ToLower(schema+"."+name)] = e
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	for i := range tables {
-		tables[i].EstimatedRows = est[strings.ToLower(tables[i].Schema+"."+tables[i].Name)]
+		e := est[strings.ToLower(tables[i].Schema+"."+tables[i].Name)]
+		tables[i].EstimatedRows, tables[i].EstimatedBytes = e.rows, e.bytes
 	}
 	return nil
 }
