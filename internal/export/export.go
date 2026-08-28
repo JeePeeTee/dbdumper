@@ -67,8 +67,62 @@ type Progress struct {
 	// server would not tell us. Progress can exceed it: the estimate is read
 	// before the dump and rows can be inserted while it runs.
 	EstimatedRows int64
-	Bytes         int64
-	Elapsed       time.Duration
+	// TableBytes is this table's source size, the share of TotalBytes it
+	// represents.
+	TableBytes int64
+	Bytes      int64
+	Elapsed    time.Duration
+
+	// The export as a whole. Work is counted in the source bytes reported by
+	// the engine, not in rows and not in the bytes written: rows per second
+	// varies tenfold between a table of integers and a table of blobs, and the
+	// bytes written differ from the bytes read by a ratio that depends on the
+	// column types. Source bytes per second is the one measure that stays
+	// roughly comparable across tables, and it calibrates itself as the run
+	// proceeds.
+	//
+	// TotalBytes covers only what this run will read: tables resumed from an
+	// earlier run cost nothing now and are excluded from both totals.
+	TotalBytes   int64
+	DoneBytes    int64
+	TotalElapsed time.Duration
+}
+
+// OverallFraction returns how far the whole export has got, in 0..1, and
+// whether that is meaningful.
+func (p Progress) OverallFraction() (float64, bool) {
+	if p.TotalBytes <= 0 {
+		return 0, false
+	}
+	done := float64(p.DoneBytes)
+	// Credit the table in flight for the share of itself it has read, so the
+	// figure moves during a long table instead of jumping when it finishes.
+	if f, ok := p.Fraction(); ok {
+		done += f * float64(p.currentTableBytes())
+	}
+	frac := done / float64(p.TotalBytes)
+	if frac > 1 {
+		frac = 1
+	}
+	return frac, true
+}
+
+// currentTableBytes is the source size of the table being read, which is the
+// part of TotalBytes that DoneBytes does not yet account for.
+func (p Progress) currentTableBytes() int64 { return p.TableBytes }
+
+// OverallETA extrapolates the whole export from the rate achieved so far.
+func (p Progress) OverallETA() (time.Duration, bool) {
+	frac, ok := p.OverallFraction()
+	if !ok || frac <= 0 || p.TotalElapsed < 2*time.Second {
+		return 0, false
+	}
+	rate := frac / p.TotalElapsed.Seconds() // fraction per second
+	if rate <= 0 {
+		return 0, false
+	}
+	remaining := (1 - frac) / rate
+	return time.Duration(remaining) * time.Second, true
 }
 
 // Fraction returns how far along this table is, in 0..1, and whether that is
@@ -242,11 +296,34 @@ func openSpool(dbm *model.Database, src model.Source, opts Options) (*spool.Spoo
 	return sp, map[string]spool.TableState{}, nil
 }
 
+// overall tracks the whole run so a per-table progress report can say how much
+// of the export is left.
+type overall struct {
+	total   int64     // source bytes this run will read
+	done    int64     // source bytes finished
+	started time.Time // when the first table began
+}
+
 // spoolTables writes every table not already present in the work directory.
 func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[string]spool.TableState,
 	dbm *model.Database, res *Result, opts Options) error {
 
 	skipData := sqlsrv.NewTableFilter(opts.ExcludeData, nil)
+
+	// Size the run before starting it, counting only tables this run will
+	// actually read: skipped ones cost nothing, and resumed ones already did.
+	all := &overall{started: time.Now()}
+	for i := range dbm.Tables {
+		t := &dbm.Tables[i]
+		if skipData != nil && skipData(t.Schema, t.Name) {
+			continue
+		}
+		if _, done := states[strings.ToLower(t.Schema+"."+t.Name)]; done {
+			continue
+		}
+		all.total += t.EstimatedBytes
+	}
+
 	for i := range dbm.Tables {
 		t := &dbm.Tables[i]
 		if skipData != nil && skipData(t.Schema, t.Name) {
@@ -266,10 +343,11 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 			continue
 		}
 
-		st, err := dumpTable(ctx, db, sp, i, t, opts, i+1, len(dbm.Tables))
+		st, err := dumpTable(ctx, db, sp, i, t, opts, i+1, len(dbm.Tables), all)
 		if err != nil {
 			return fmt.Errorf("dump %s.%s: %w", t.Schema, t.Name, err)
 		}
+		all.done += t.EstimatedBytes
 		if st.Entry == "" {
 			continue // no insertable columns; nothing was spooled
 		}
@@ -416,7 +494,7 @@ func warnUntrustedKeys(dbm *model.Database, opts Options) {
 // dumpTable writes one table's rows and reports how many, and how many
 // uncompressed bytes they took.
 func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *model.Table,
-	opts Options, pos, total int) (spool.TableState, error) {
+	opts Options, pos, total int, all *overall) (spool.TableState, error) {
 
 	var none spool.TableState
 	cols := dataColumns(*t)
@@ -503,8 +581,12 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *m
 					TableCount:    total,
 					Rows:          n,
 					EstimatedRows: estimated,
+					TableBytes:    t.EstimatedBytes,
 					Bytes:         cw.n,
 					Elapsed:       now.Sub(start),
+					TotalBytes:    all.total,
+					DoneBytes:     all.done,
+					TotalElapsed:  now.Sub(all.started),
 				})
 			}
 		}

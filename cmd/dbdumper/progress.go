@@ -55,7 +55,13 @@ func renderProgress(p export.Progress, width int) string {
 func composeProgress(p export.Progress, width int, withBar, withBytes, withCounter bool) string {
 	var head strings.Builder
 	if withCounter && p.TableCount > 0 {
-		fmt.Fprintf(&head, "[%d/%d] ", p.TableIndex, p.TableCount)
+		// The overall percentage rides in the counter: it is the same question
+		// - how far along is this - and costs four characters there.
+		if f, ok := p.OverallFraction(); ok {
+			fmt.Fprintf(&head, "[%d/%d %.0f%%] ", p.TableIndex, p.TableCount, f*100)
+		} else {
+			fmt.Fprintf(&head, "[%d/%d] ", p.TableIndex, p.TableCount)
+		}
 	}
 	tail := progressTail(p, withBar, withBytes)
 
@@ -89,10 +95,19 @@ func progressTail(p export.Progress, withBar, withBytes bool) string {
 		fmt.Fprintf(&b, " %s", humanBytes(p.Bytes))
 	}
 
-	if eta, ok := p.ETA(); ok {
+	// One ETA, and it is the one worth knowing: when the export finishes, not
+	// when this table does. The per-table figure only ever stood in for it, and
+	// is used when the whole-run estimate has nothing to work from - no byte
+	// estimates from the server, or too little history to extrapolate.
+	switch eta, ok := p.OverallETA(); {
+	case ok:
 		fmt.Fprintf(&b, " ETA %s", compactDuration(eta))
-	} else {
-		fmt.Fprintf(&b, " %s", compactDuration(p.Elapsed.Round(time.Second)))
+	default:
+		if eta, ok := p.ETA(); ok {
+			fmt.Fprintf(&b, " ETA %s", compactDuration(eta))
+		} else {
+			fmt.Fprintf(&b, " %s", compactDuration(p.Elapsed.Round(time.Second)))
+		}
 	}
 	return b.String()
 }
