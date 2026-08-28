@@ -21,10 +21,11 @@ func runExport(ctx context.Context, args []string) error {
 	force := fs.Bool("force", false, "overwrite --out if it already exists")
 	resume := fs.Bool("resume", false, "continue an export interrupted earlier")
 	restart := fs.Bool("restart", false, "discard an interrupted export and start over")
-	var include, exclude, excludeData stringList
+	var include, exclude, excludeData, where stringList
 	fs.Var(&include, "include", "only these tables; glob on schema.table, repeatable")
 	fs.Var(&exclude, "exclude", "omit these tables entirely, definition included; repeatable")
 	fs.Var(&excludeData, "exclude-data", "keep these tables' definitions but skip their rows; repeatable")
+	fs.Var(&where, "where", "restrict a table's rows: <table-glob>:<T-SQL predicate>; repeatable")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -68,6 +69,7 @@ func runExport(ctx context.Context, args []string) error {
 		Include:          include,
 		Exclude:          exclude,
 		ExcludeData:      excludeData,
+		Where:            where,
 		Resume:           *resume,
 		Restart:          *restart,
 		Log:              logf,

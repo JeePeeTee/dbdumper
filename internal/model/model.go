@@ -110,7 +110,15 @@ type Table struct {
 	// archive while the definition was kept. Foreign keys pointing at such a
 	// table cannot be validated on restore.
 	DataSkipped bool `json:"dataSkipped,omitempty"`
+	// RowFilter is the --where predicate the rows were selected with, if any.
+	// Its presence means the archive holds a subset of the table.
+	RowFilter string `json:"rowFilter,omitempty"`
 }
+
+// PartialData reports whether the archive holds fewer rows than the source
+// table had - because they were skipped outright, or filtered. Foreign keys
+// pointing at such a table cannot be validated on restore.
+func (t Table) PartialData() bool { return t.DataSkipped || t.RowFilter != "" }
 
 // QualifiedName returns the bracket-quoted [schema].[table].
 func (t Table) QualifiedName() string { return Quote(t.Schema) + "." + Quote(t.Name) }

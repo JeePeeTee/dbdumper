@@ -192,6 +192,7 @@ to read it and does not try. Get the plaintext from whatever code in your app de
 --include <glob>       only these tables, glob on schema.table, repeatable
 --exclude <glob>       omit these tables entirely, definition included, repeatable
 --exclude-data <glob>  keep these tables' definitions but skip their rows, repeatable
+--where <glob>:<sql>   dump only the rows matching a predicate, repeatable
 ```
 
 Globs match case-insensitively against `schema.table`. A pattern with no dot is treated as
@@ -215,6 +216,42 @@ keys those are:
 ```
 
 Exclude the referencing tables' data too if you need referential integrity.
+
+### Taking part of a table
+
+`--exclude-data` is all-or-nothing. `--where` keeps a slice instead:
+
+```bash
+dbdumper export --server ... --database AppDb --out AppDb.dbdump   --where "LogEvents:CreatedOn > dateadd(day,-90,getutcdate())"   --where "AuditTrail:Level >= 3"
+```
+
+The part before the first colon is a table glob, matched exactly as `--include` and `--exclude`
+are — case-insensitive against `schema.table`, and a bare name means `*.name`. Everything after it
+is **raw T-SQL**, appended to the table's `SELECT` as a `WHERE` clause. Only the first colon
+splits, so a predicate may contain them:
+
+```bash
+--where "Shifts:StartsAt >= '08:30:00' AND EndsAt <= '17:00:00'"
+```
+
+There is nothing to escape and nothing is validated: the predicate is an expression, not a value,
+and a bad one comes back as a SQL Server error naming the table. Patterns are tried in order and
+the first match wins, so put a specific rule before a general one; a table matched by more than one
+is reported rather than resolved silently.
+
+Three consequences worth knowing:
+
+- **Foreign keys pointing at a filtered table are created `WITH NOCHECK`** and left untrusted,
+  exactly as for `--exclude-data`, because rows elsewhere may reference rows the filter excluded.
+  Export lists which keys those are.
+- **No percentage or ETA for a filtered table.** The row estimate behind the progress bar counts
+  the whole table, so it would be wrong. The line falls back to a running count and elapsed time.
+- **Changing a `--where` invalidates a resume.** The predicates are part of the fingerprint, so
+  continuing an interrupted export under a different filter is refused rather than mixing rows
+  selected two different ways.
+
+The filter is recorded in the manifest as `rowFilter`, so an archive says on its face that it holds
+a subset.
 
 ### Resuming an interrupted export
 

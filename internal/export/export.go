@@ -24,6 +24,9 @@ type Options struct {
 	SchemaOnly bool
 	Include    []string // glob patterns, schema.table; empty means everything
 	Exclude    []string
+	// Where holds "<table-glob>:<predicate>" specifications restricting which
+	// rows of a table are dumped.
+	Where []string
 	// ExcludeData names tables whose definition is kept but whose rows are
 	// skipped. Unlike Exclude, the table, its indexes and its constraints are
 	// still created on restore - it just comes back empty.
@@ -156,6 +159,19 @@ func Run(ctx context.Context, db *sql.DB, opts Options) (*Result, error) {
 	}
 	opts.log("found %d schemas, %d tables, %d modules, %d sequences, %d user types",
 		len(dbm.Schemas), len(dbm.Tables), len(dbm.Modules), len(dbm.Sequences), len(dbm.UserTypes))
+
+	rowFilter, err := sqlsrv.NewRowFilter(opts.Where, opts.warn)
+	if err != nil {
+		return nil, err
+	}
+	// Recorded on the model before the fingerprint is taken, so that changing a
+	// --where between runs makes a resume refuse rather than mix two filters.
+	if rowFilter != nil {
+		for i := range dbm.Tables {
+			t := &dbm.Tables[i]
+			t.RowFilter = rowFilter(t.Schema, t.Name)
+		}
+	}
 
 	res := &Result{Tables: len(dbm.Tables)}
 
@@ -349,6 +365,11 @@ func fingerprint(database string, dbm *model.Database) string {
 		for _, c := range t.Columns {
 			cols = append(cols, c.Name)
 		}
+		if t.RowFilter != "" {
+			// Part of the shape for resume purposes: rows already spooled under
+			// one predicate must not be mixed with rows read under another.
+			cols = append(cols, "!where="+t.RowFilter)
+		}
 		shapes = append(shapes, spool.TableShape{Schema: t.Schema, Name: t.Name, Columns: cols})
 	}
 	return spool.Fingerprint(database, shapes)
@@ -361,7 +382,7 @@ func fingerprint(database string, dbm *model.Database) string {
 func warnUntrustedKeys(dbm *model.Database, opts Options) {
 	skipped := map[string]bool{}
 	for _, t := range dbm.Tables {
-		if t.DataSkipped {
+		if t.PartialData() {
 			skipped[strings.ToLower(t.Schema+"."+t.Name)] = true
 		}
 	}
@@ -371,7 +392,7 @@ func warnUntrustedKeys(dbm *model.Database, opts Options) {
 	var affected []string
 	for _, t := range dbm.Tables {
 		for _, fk := range t.ForeignKeys {
-			if skipped[strings.ToLower(fk.ReferencedSchema+"."+fk.ReferencedTable)] && !t.DataSkipped {
+			if skipped[strings.ToLower(fk.ReferencedSchema+"."+fk.ReferencedTable)] && !t.PartialData() {
 				affected = append(affected, fmt.Sprintf("%s on %s.%s -> %s.%s",
 					fk.Name, t.Schema, t.Name, fk.ReferencedSchema, fk.ReferencedTable))
 			}
@@ -380,7 +401,7 @@ func warnUntrustedKeys(dbm *model.Database, opts Options) {
 	if len(affected) == 0 {
 		return
 	}
-	opts.warn("%d foreign key(s) point at a table whose data was skipped; they will be created", len(affected))
+	opts.warn("%d foreign key(s) point at a table that was skipped or filtered; they will be created", len(affected))
 	opts.warn("WITH NOCHECK and left untrusted, so the restored database will have dangling references:")
 	for i, a := range affected {
 		if i >= 10 {
@@ -432,6 +453,16 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *m
 	}
 
 	query := "SELECT " + codec.SelectList() + " FROM " + t.QualifiedName()
+	// The predicate is raw T-SQL from the caller's own command line, spliced in
+	// as written. There is nothing to escape: it is an expression, not a value,
+	// and the caller already controls the connection string.
+	estimated := t.EstimatedRows
+	if t.RowFilter != "" {
+		query += " WHERE " + t.RowFilter
+		// The engine's row count is for the whole table, so it would make the
+		// bar and the ETA lie. Better no percentage than a wrong one.
+		estimated = 0
+	}
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return none, fmt.Errorf("%s: %w", query, err)
@@ -471,7 +502,7 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *m
 					TableIndex:    pos,
 					TableCount:    total,
 					Rows:          n,
-					EstimatedRows: t.EstimatedRows,
+					EstimatedRows: estimated,
 					Bytes:         cw.n,
 					Elapsed:       now.Sub(start),
 				})
@@ -490,7 +521,11 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *m
 		return none, err
 	}
 	// A permanent line here replaces whatever transient line was last drawn.
-	opts.log("  %-50s %10d rows  %10s", t.Schema+"."+t.Name, n, humanBytes(cw.n))
+	suffix := ""
+	if t.RowFilter != "" {
+		suffix = " (filtered)"
+	}
+	opts.log("  %-50s %10d rows  %10s%s", t.Schema+"."+t.Name, n, humanBytes(cw.n), suffix)
 	return st, nil
 }
 
