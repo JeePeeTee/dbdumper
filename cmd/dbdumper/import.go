@@ -42,7 +42,9 @@ func runImport(ctx context.Context, args []string) error {
 	if *schemaOnly && *dataOnly {
 		return errors.New("--schema-only and --data-only are mutually exclusive")
 	}
-	finishConn(fs, conn)
+	if err := finishConn(fs, conn); err != nil {
+		return err
+	}
 	target := conn.DatabaseName()
 	if target == "" {
 		return errors.New("--database is required")
