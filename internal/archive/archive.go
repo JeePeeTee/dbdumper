@@ -19,17 +19,37 @@ import (
 const ManifestName = "manifest.json"
 
 // DataPath returns the archive entry name for a table's rows.
+//
+// The encoding has to be injective. Replacing awkward characters with "_", as
+// this once did, is not: schema "a/b" and schema "a_b" collapse together, and
+// so do schema "dbo" table "a.b" and schema "dbo.a" table "b", because the dot
+// that joins the two parts is also legal inside either of them. Colliding names
+// are not rejected by the zip writer, so one table's rows would silently
+// replace another's.
 func DataPath(schema, table string) string {
-	safe := func(s string) string {
-		return strings.Map(func(r rune) rune {
-			switch r {
-			case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
-				return '_'
-			}
-			return r
-		}, s)
+	return path.Join("data", escapeSegment(schema)+"."+escapeSegment(table)+".jsonl")
+}
+
+// escapeSegment percent-encodes everything that would make an entry name
+// ambiguous or illegal on a filesystem: the separator this package joins with,
+// the characters Windows forbids, and "%" itself so the encoding can be undone.
+func escapeSegment(s string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '%' || r == '.' || r == '/' || r == '\\' || r == ':' ||
+			r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|',
+			r < 0x20:
+			b.WriteByte('%')
+			b.WriteByte(hex[(r>>4)&0xF])
+			b.WriteByte(hex[r&0xF])
+		default:
+			b.WriteRune(r)
+		}
 	}
-	return path.Join("data", safe(schema)+"."+safe(table)+".jsonl")
+	return b.String()
 }
 
 // Writer builds an archive. Entries are written sequentially.
