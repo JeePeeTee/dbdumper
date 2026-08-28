@@ -30,7 +30,9 @@ func runExport(ctx context.Context, args []string) error {
 	if *out == "" {
 		return errors.New("--out is required")
 	}
-	finishConn(fs, conn)
+	if err := finishConn(fs, conn); err != nil {
+		return err
+	}
 	if conn.DatabaseName() == "" {
 		return errors.New("--database is required")
 	}

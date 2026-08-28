@@ -109,16 +109,30 @@ func connFlags(fs *flag.FlagSet) *sqlsrv.ConnConfig {
 	return c
 }
 
-func finishConn(fs *flag.FlagSet, c *sqlsrv.ConnConfig) {
+func finishConn(fs *flag.FlagSet, c *sqlsrv.ConnConfig) error {
 	explicit := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 
 	// A password on the command line ends up in shell history and in the
 	// process list, so allow it to arrive out of band instead.
+	passwordFromEnv := false
 	if c.Password == "" {
-		c.Password = os.Getenv("DBDUMPER_PASSWORD")
+		if env := os.Getenv("DBDUMPER_PASSWORD"); env != "" {
+			c.Password, passwordFromEnv = env, true
+		}
 	}
-	if c.User == "" && c.Password == "" {
+
+	// No login name means Windows authentication, and a password without one
+	// is unusable either way: the connection string builder needs a user to
+	// attach it to. Which mistake it is decides how loudly to complain.
+	if c.User == "" {
+		if c.Password != "" {
+			if !passwordFromEnv {
+				return errors.New("--password was given without --user; add --user, or drop --password to use Windows authentication")
+			}
+			warnf("DBDUMPER_PASSWORD is set but --user is not; ignoring it and using Windows authentication")
+			c.Password = ""
+		}
 		c.Trusted = true
 	}
 
@@ -139,6 +153,7 @@ func finishConn(fs *flag.FlagSet, c *sqlsrv.ConnConfig) {
 			c.TrustCert = false
 		}
 	}
+	return nil
 }
 
 // stringList is a repeatable flag that also accepts comma-separated values.
