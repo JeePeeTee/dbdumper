@@ -106,6 +106,11 @@ type Table struct {
 	// so progress has something to count towards. It can be slightly stale, so
 	// it drives display only, never control flow.
 	EstimatedRows int64 `json:"estimatedRows,omitempty"`
+	// EstimatedBytes is how much the table occupies at the source, from the
+	// same reading. It is the unit the whole-export estimate works in: rows per
+	// second varies tenfold between a table of integers and a table of blobs,
+	// where bytes per second stays roughly comparable.
+	EstimatedBytes int64 `json:"estimatedBytes,omitempty"`
 	// DataSkipped records that the rows were deliberately left out of the
 	// archive while the definition was kept. Foreign keys pointing at such a
 	// table cannot be validated on restore.

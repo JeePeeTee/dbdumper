@@ -298,3 +298,110 @@ func TestWidthReservesSpinnerCells(t *testing.T) {
 		t.Errorf("floored lineWidth = %d, want %d", got, minWidth)
 	}
 }
+
+func TestOverallFraction(t *testing.T) {
+	cases := []struct {
+		name string
+		p    export.Progress
+		want float64
+		ok   bool
+	}{
+		{"no byte estimates, no figure", export.Progress{Rows: 5}, 0, false},
+		{"nothing done yet", export.Progress{TotalBytes: 1000}, 0, true},
+		{"finished tables only", export.Progress{TotalBytes: 1000, DoneBytes: 400}, 0.4, true},
+		{
+			// The table in flight counts for the share of itself it has read,
+			// so the figure moves during a long table instead of jumping.
+			name: "credit for the table in flight",
+			p: export.Progress{
+				TotalBytes: 1000, DoneBytes: 400,
+				TableBytes: 200, Rows: 50, EstimatedRows: 100,
+			},
+			want: 0.5, ok: true,
+		},
+		{
+			// Estimates are stale by nature; the bar must not exceed full.
+			name: "clamped when the estimates undershoot",
+			p: export.Progress{
+				TotalBytes: 100, DoneBytes: 90,
+				TableBytes: 100, Rows: 500, EstimatedRows: 100,
+			},
+			want: 1, ok: true,
+		},
+	}
+	for _, c := range cases {
+		got, ok := c.p.OverallFraction()
+		if ok != c.ok {
+			t.Errorf("%s: ok = %v, want %v", c.name, ok, c.ok)
+			continue
+		}
+		if ok && (got < c.want-0.001 || got > c.want+0.001) {
+			t.Errorf("%s: got %.3f, want %.3f", c.name, got, c.want)
+		}
+	}
+}
+
+func TestOverallETA(t *testing.T) {
+	// A quarter of the bytes in ten seconds implies thirty seconds more.
+	p := export.Progress{TotalBytes: 1000, DoneBytes: 250, TotalElapsed: 10 * time.Second}
+	eta, ok := p.OverallETA()
+	if !ok || eta != 30*time.Second {
+		t.Errorf("got %v (%v), want 30s", eta, ok)
+	}
+
+	// Too early to extrapolate anything.
+	if _, ok := (export.Progress{TotalBytes: 1000, DoneBytes: 1, TotalElapsed: time.Second}).OverallETA(); ok {
+		t.Error("should not extrapolate from under two seconds")
+	}
+	// Nothing read yet is not a rate.
+	if _, ok := (export.Progress{TotalBytes: 1000, TotalElapsed: time.Minute}).OverallETA(); ok {
+		t.Error("zero progress cannot give an ETA")
+	}
+	// No estimates from the server at all.
+	if _, ok := (export.Progress{DoneBytes: 500, TotalElapsed: time.Minute}).OverallETA(); ok {
+		t.Error("without TotalBytes there is nothing to extrapolate")
+	}
+}
+
+// TestOverallETAPreferredOverTable - the question a user has is when the export
+// finishes, not when the current table does.
+func TestOverallETAPreferredOverTable(t *testing.T) {
+	p := export.Progress{
+		Table: "dbo.Big", TableIndex: 3, TableCount: 10,
+		Rows: 50, EstimatedRows: 100, TableBytes: 100, Elapsed: 10 * time.Second,
+		TotalBytes: 1000, DoneBytes: 100, TotalElapsed: 20 * time.Second,
+	}
+	// The table alone would say 10s; the run as a whole says far more.
+	tableETA, _ := p.ETA()
+	overallETA, ok := p.OverallETA()
+	if !ok {
+		t.Fatal("expected an overall ETA")
+	}
+	if overallETA <= tableETA {
+		t.Fatalf("this fixture is meant to distinguish them: table=%v overall=%v", tableETA, overallETA)
+	}
+	line := renderProgress(p, 120)
+	if !strings.Contains(line, "ETA "+compactDuration(overallETA)) {
+		t.Errorf("the line should carry the overall ETA %v, got %q", overallETA, line)
+	}
+	// And the overall percentage rides in the counter.
+	if !strings.Contains(line, "[3/10 15%]") {
+		t.Errorf("expected the overall percentage in the counter, got %q", line)
+	}
+}
+
+// TestFallsBackToTheTableETA - with no byte estimates from the server the line
+// still says something useful rather than nothing.
+func TestFallsBackToTheTableETA(t *testing.T) {
+	p := export.Progress{
+		Table: "dbo.T", TableIndex: 1, TableCount: 1,
+		Rows: 50, EstimatedRows: 100, Elapsed: 10 * time.Second,
+	}
+	line := renderProgress(p, 120)
+	if !strings.Contains(line, "ETA 10s") {
+		t.Errorf("expected the per-table ETA as a fallback, got %q", line)
+	}
+	if strings.Contains(line, "%]") {
+		t.Errorf("no overall percentage should appear without byte estimates: %q", line)
+	}
+}
