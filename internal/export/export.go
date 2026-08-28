@@ -14,6 +14,7 @@ import (
 	"github.com/JeePeeTee/dbdumper/internal/archive"
 	"github.com/JeePeeTee/dbdumper/internal/model"
 	"github.com/JeePeeTee/dbdumper/internal/plan"
+	"github.com/JeePeeTee/dbdumper/internal/spool"
 	"github.com/JeePeeTee/dbdumper/internal/sqlsrv"
 )
 
@@ -27,6 +28,12 @@ type Options struct {
 	// skipped. Unlike Exclude, the table, its indexes and its constraints are
 	// still created on restore - it just comes back empty.
 	ExcludeData []string
+	// Resume continues an interrupted export from its work directory instead
+	// of starting over. Restart discards that directory. With neither, an
+	// existing work directory is an error rather than a silent choice.
+	Resume  bool
+	Restart bool
+
 	// ProgressInterval is how often a long-running table reports progress.
 	// Zero means the 5s default; negative disables per-table progress.
 	ProgressInterval time.Duration
@@ -120,7 +127,10 @@ type Result struct {
 	// tables. It is not the archive's size on disk: the archive is deflated
 	// and also holds the manifest and the DDL scripts.
 	DataBytes int64
-	Duration  time.Duration
+	// ResumedTables counts tables taken from an interrupted run's work
+	// directory rather than read from the database again.
+	ResumedTables int
+	Duration      time.Duration
 }
 
 // Run performs the dump.
@@ -147,40 +157,144 @@ func Run(ctx context.Context, db *sql.DB, opts Options) (*Result, error) {
 	opts.log("found %d schemas, %d tables, %d modules, %d sequences, %d user types",
 		len(dbm.Schemas), len(dbm.Tables), len(dbm.Modules), len(dbm.Sequences), len(dbm.UserTypes))
 
-	w, err := archive.Create(opts.Out)
+	res := &Result{Tables: len(dbm.Tables)}
+
+	// Rows go to a work directory first. archive/zip cannot append to a
+	// finished file, so writing them straight into the archive would leave an
+	// interrupted run with nothing a later one could continue from.
+	sp, states, err := openSpool(dbm, src, opts)
 	if err != nil {
 		return nil, err
 	}
-	// Close is deliberate below; on the error paths the partial file is left in
-	// place so the caller can inspect it.
-	defer w.Close()
-
-	res := &Result{Tables: len(dbm.Tables)}
 
 	if !opts.SchemaOnly {
-		skipData := sqlsrv.NewTableFilter(opts.ExcludeData, nil)
-		for i := range dbm.Tables {
-			t := &dbm.Tables[i]
-			if skipData != nil && skipData(t.Schema, t.Name) {
-				t.DataSkipped = true
-				opts.log("  %-50s %10s", t.Schema+"."+t.Name, "(data skipped)")
-				continue
-			}
-			n, bytes, err := dumpTable(ctx, db, w, t, opts, i+1, len(dbm.Tables))
-			if err != nil {
-				return nil, fmt.Errorf("dump %s.%s: %w", t.Schema, t.Name, err)
-			}
-			t.RowCount = n
-			res.Rows += n
-			res.DataBytes += bytes
+		if err := spoolTables(ctx, db, sp, states, dbm, res, opts); err != nil {
+			return nil, err
 		}
 	}
 
 	warnUntrustedKeys(dbm, opts)
 
+	if err := packageArchive(sp, states, dbm, src, opts); err != nil {
+		return nil, err
+	}
+	if err := sp.Discard(); err != nil {
+		opts.warn("could not remove the work directory %s: %v", sp.Dir(), err)
+	}
+
+	res.Duration = time.Since(start)
+	return res, nil
+}
+
+// openSpool creates or resumes the work directory and reports what an earlier
+// run already finished.
+func openSpool(dbm *model.Database, src model.Source, opts Options) (*spool.Spool, map[string]spool.TableState, error) {
+	dir := spool.DirFor(opts.Out)
+	meta := spool.Meta{
+		Tool:        "dbdumper",
+		StartedAt:   time.Now().UTC(),
+		Server:      src.Server,
+		Database:    src.Database,
+		Fingerprint: fingerprint(src.Database, dbm),
+	}
+
+	if spool.Exists(dir) && !opts.Restart {
+		if !opts.Resume {
+			return nil, nil, fmt.Errorf("an interrupted export is present in %s; pass --resume to continue it, or --restart to discard it", dir)
+		}
+		sp, err := spool.Resume(dir, meta)
+		if err != nil {
+			return nil, nil, err
+		}
+		states, err := sp.Completed()
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(states) > 0 {
+			opts.log("resuming: %d table(s) already dumped in %s", len(states), dir)
+		}
+		return sp, states, nil
+	}
+
+	if opts.Resume && !spool.Exists(dir) {
+		opts.warn("--resume was given but there is no interrupted export in %s; starting fresh", dir)
+	}
+	sp, err := spool.Create(dir, meta)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sp, map[string]spool.TableState{}, nil
+}
+
+// spoolTables writes every table not already present in the work directory.
+func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[string]spool.TableState,
+	dbm *model.Database, res *Result, opts Options) error {
+
+	skipData := sqlsrv.NewTableFilter(opts.ExcludeData, nil)
+	for i := range dbm.Tables {
+		t := &dbm.Tables[i]
+		if skipData != nil && skipData(t.Schema, t.Name) {
+			t.DataSkipped = true
+			opts.log("  %-50s %10s", t.Schema+"."+t.Name, "(data skipped)")
+			continue
+		}
+
+		identity := strings.ToLower(t.Schema + "." + t.Name)
+		if st, done := states[identity]; done {
+			t.RowCount, t.DataFile = st.Rows, st.Entry
+			res.Rows += st.Rows
+			res.DataBytes += int64(st.UncompressedSize)
+			res.ResumedTables++
+			opts.log("  %-50s %10d rows  %10s (resumed)",
+				t.Schema+"."+t.Name, st.Rows, humanBytes(int64(st.UncompressedSize)))
+			continue
+		}
+
+		st, err := dumpTable(ctx, db, sp, i, t, opts, i+1, len(dbm.Tables))
+		if err != nil {
+			return fmt.Errorf("dump %s.%s: %w", t.Schema, t.Name, err)
+		}
+		if st.Entry == "" {
+			continue // no insertable columns; nothing was spooled
+		}
+		states[identity] = st
+		t.RowCount, t.DataFile = st.Rows, st.Entry
+		res.Rows += st.Rows
+		res.DataBytes += int64(st.UncompressedSize)
+	}
+	return nil
+}
+
+// packageArchive assembles the finished archive from the work directory.
+//
+// Spooled data is spliced in already compressed, and each table's spool file is
+// dropped as soon as it is safely inside, so two full copies of the data never
+// exist at once.
+func packageArchive(sp *spool.Spool, states map[string]spool.TableState,
+	dbm *model.Database, src model.Source, opts Options) error {
+
+	opts.log("packaging %s...", opts.Out)
+	w, err := archive.Create(opts.Out)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+
+	for i := range dbm.Tables {
+		t := &dbm.Tables[i]
+		st, ok := states[strings.ToLower(t.Schema+"."+t.Name)]
+		if !ok {
+			continue
+		}
+		if err := copySpooled(w, sp, st); err != nil {
+			return fmt.Errorf("package %s.%s: %w", t.Schema, t.Name, err)
+		}
+		sp.DropData(st)
+	}
+
 	for _, ph := range plan.AllPhases(dbm) {
 		if err := w.AddText(ph.File, plan.ScriptFor(ph)); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
@@ -192,17 +306,52 @@ func Run(ctx context.Context, db *sql.DB, opts Options) (*Result, error) {
 		Database:      *dbm,
 	}
 	if err := w.AddJSON(archive.ManifestName, manifest); err != nil {
-		return nil, err
+		return err
 	}
 	if err := w.AddText("README.txt", readme); err != nil {
-		return nil, err
+		return err
 	}
-	if err := w.Close(); err != nil {
-		return nil, err
-	}
+	return w.Close()
+}
 
-	res.Duration = time.Since(start)
-	return res, nil
+func copySpooled(w *archive.Writer, sp *spool.Spool, st spool.TableState) error {
+	src, err := sp.OpenData(st)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := w.AddRaw(archive.RawEntry{
+		Name:             st.Entry,
+		UncompressedSize: st.UncompressedSize,
+		CompressedSize:   st.CompressedSize,
+		CRC32:            st.CRC32,
+	})
+	if err != nil {
+		return err
+	}
+	n, err := io.Copy(dst, src)
+	if err != nil {
+		return err
+	}
+	if uint64(n) != st.CompressedSize {
+		return fmt.Errorf("spooled data for %s is %d bytes, expected %d", st.Entry, n, st.CompressedSize)
+	}
+	return nil
+}
+
+// fingerprint summarises the source schema so a resume can refuse a database
+// whose shape has changed underneath it.
+func fingerprint(database string, dbm *model.Database) string {
+	shapes := make([]spool.TableShape, 0, len(dbm.Tables))
+	for _, t := range dbm.Tables {
+		cols := make([]string, 0, len(t.Columns))
+		for _, c := range t.Columns {
+			cols = append(cols, c.Name)
+		}
+		shapes = append(shapes, spool.TableShape{Schema: t.Schema, Name: t.Name, Columns: cols})
+	}
+	return spool.Fingerprint(database, shapes)
 }
 
 // warnUntrustedKeys reports the foreign keys that --exclude-data has made
@@ -245,20 +394,27 @@ func warnUntrustedKeys(dbm *model.Database, opts Options) {
 
 // dumpTable writes one table's rows and reports how many, and how many
 // uncompressed bytes they took.
-func dumpTable(ctx context.Context, db *sql.DB, w *archive.Writer, t *model.Table, opts Options, pos, total int) (int64, int64, error) {
+func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *model.Table,
+	opts Options, pos, total int) (spool.TableState, error) {
+
+	var none spool.TableState
 	cols := dataColumns(*t)
 	if len(cols) == 0 {
 		opts.warn("%s.%s has no insertable columns; skipping data", t.Schema, t.Name)
-		return 0, 0, nil
+		return none, nil
 	}
 	codec := sqlsrv.NewRowCodec(cols)
 
 	entry := archive.DataPath(t.Schema, t.Name)
-	out, err := w.Add(entry)
+	tw, err := sp.NewTable(index, strings.ToLower(t.Schema+"."+t.Name), entry)
 	if err != nil {
-		return 0, 0, err
+		return none, err
 	}
-	bw := bufio.NewWriterSize(out, 1<<20)
+	// Anything short of Commit leaves the table unfinished, so a resume will
+	// simply do it again.
+	defer tw.Abort()
+
+	bw := bufio.NewWriterSize(tw, 1<<20)
 	cw := &countingWriter{w: bw}
 	enc := json.NewEncoder(cw)
 	enc.SetEscapeHTML(false)
@@ -272,13 +428,13 @@ func dumpTable(ctx context.Context, db *sql.DB, w *archive.Writer, t *model.Tabl
 		Columns []string `json:"columns"`
 	}{t.Schema + "." + t.Name, names}
 	if err := enc.Encode(header); err != nil {
-		return 0, 0, err
+		return none, err
 	}
 
 	query := "SELECT " + codec.SelectList() + " FROM " + t.QualifiedName()
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return 0, 0, fmt.Errorf("%s: %w", query, err)
+		return none, fmt.Errorf("%s: %w", query, err)
 	}
 	defer rows.Close()
 
@@ -297,10 +453,10 @@ func dumpTable(ctx context.Context, db *sql.DB, w *archive.Writer, t *model.Tabl
 	buf := make([]any, 0, len(cols))
 	for rows.Next() {
 		if err := rows.Scan(codec.ScanDest()...); err != nil {
-			return 0, 0, err
+			return none, err
 		}
 		if err := enc.Encode(codec.Encode(buf)); err != nil {
-			return 0, 0, err
+			return none, err
 		}
 		n++
 
@@ -323,16 +479,19 @@ func dumpTable(ctx context.Context, db *sql.DB, w *archive.Writer, t *model.Tabl
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return 0, 0, err
+		return none, err
 	}
 	if err := bw.Flush(); err != nil {
-		return 0, 0, err
+		return none, err
 	}
 
-	t.DataFile = entry
+	st, err := tw.Commit(n)
+	if err != nil {
+		return none, err
+	}
 	// A permanent line here replaces whatever transient line was last drawn.
 	opts.log("  %-50s %10d rows  %10s", t.Schema+"."+t.Name, n, humanBytes(cw.n))
-	return n, cw.n, nil
+	return st, nil
 }
 
 // countingWriter tallies the uncompressed bytes handed to the archive, so
@@ -404,6 +563,9 @@ Value encoding
 
 Computed columns and rowversion/timestamp columns are not stored: they are
 regenerated by the server on import.
+
+An interrupted export leaves a <archive>.part work directory beside the output.
+Re-run the same command with --resume to continue it, or --restart to discard it.
 
 Restore with:
   dbdumper import --server <host> --database <newdb> --create-database --in <this file>
