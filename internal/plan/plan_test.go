@@ -101,3 +101,52 @@ func TestFinalizeSkipsEmptyTables(t *testing.T) {
 		t.Errorf("wrong table reseeded:\n%s", stmts[0].SQL)
 	}
 }
+
+// TestForeignKeysToFilteredDataAreNotChecked - a --where predicate leaves a
+// table holding a subset of its rows, so keys pointing at it are in exactly the
+// same position as keys pointing at a table whose data was skipped entirely.
+func TestForeignKeysToFilteredDataAreNotChecked(t *testing.T) {
+	db := &model.Database{Tables: []model.Table{
+		{Schema: "dbo", Name: "LogEvents", RowFilter: "CreatedOn > dateadd(day,-90,getutcdate())"},
+		{Schema: "dbo", Name: "Whole"},
+		{Schema: "dbo", Name: "Ref", ForeignKeys: []model.ForeignKey{
+			{Name: "FK_Ref_LogEvents", Columns: []string{"LogId"},
+				ReferencedSchema: "dbo", ReferencedTable: "LogEvents", ReferencedColumns: []string{"Oid"}},
+			{Name: "FK_Ref_Whole", Columns: []string{"WholeId"},
+				ReferencedSchema: "dbo", ReferencedTable: "Whole", ReferencedColumns: []string{"Oid"}},
+		}},
+	}}
+
+	got := map[string]string{}
+	for _, s := range foreignKeys(db) {
+		switch {
+		case strings.Contains(s.SQL, "[FK_Ref_LogEvents]"):
+			got["filtered"] = s.SQL
+		case strings.Contains(s.SQL, "[FK_Ref_Whole]"):
+			got["whole"] = s.SQL
+		}
+	}
+	if !strings.Contains(got["filtered"], "WITH NOCHECK") {
+		t.Errorf("key to a filtered table should be WITH NOCHECK:\n%s", got["filtered"])
+	}
+	if strings.Contains(got["whole"], "NOCHECK") {
+		t.Errorf("key to a fully dumped table should stay WITH CHECK:\n%s", got["whole"])
+	}
+}
+
+func TestPartialData(t *testing.T) {
+	cases := []struct {
+		t    model.Table
+		want bool
+	}{
+		{model.Table{}, false},
+		{model.Table{DataSkipped: true}, true},
+		{model.Table{RowFilter: "1=1"}, true},
+		{model.Table{DataSkipped: true, RowFilter: "1=1"}, true},
+	}
+	for _, c := range cases {
+		if got := c.t.PartialData(); got != c.want {
+			t.Errorf("%+v: PartialData() = %v, want %v", c.t, got, c.want)
+		}
+	}
+}

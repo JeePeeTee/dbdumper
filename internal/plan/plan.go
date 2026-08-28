@@ -161,11 +161,12 @@ func checks(db *model.Database) []Stmt {
 }
 
 func foreignKeys(db *model.Database) []Stmt {
-	// A table whose rows were deliberately skipped cannot satisfy the foreign
-	// keys pointing at it, so those have to be created unvalidated.
+	// A table holding only some of its rows - skipped outright, or filtered by
+	// --where - cannot satisfy the foreign keys pointing at it, so those have
+	// to be created unvalidated.
 	skipped := map[string]bool{}
 	for _, t := range db.Tables {
-		if t.DataSkipped {
+		if t.PartialData() {
 			skipped[strings.ToLower(t.Schema+"."+t.Name)] = true
 		}
 	}
