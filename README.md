@@ -5,6 +5,9 @@ single portable archive, and restores that archive into a new database. Same ide
 `.bacpac`, but the format is plain zip + JSON + SQL, so you can read it, diff it and script it
 without DacFx or SSMS.
 
+It is not the right tool for every job — see [when not to use this](#when-not-to-use-this) before
+reaching for it on a large cloud database.
+
 ```bash
 go build -o bin/dbdumper ./cmd/dbdumper
 ```
@@ -444,6 +447,57 @@ remaining error reported. This means module dependency order does not have to be
 
 In `--data-only` mode the schema already exists, so the loader disables triggers and constraint
 checking for the duration of the load and re-enables them afterwards.
+
+## When not to use this
+
+dbdumper reads every row over the wire, one table at a time, and writes a format designed to be
+read by humans. That buys selectivity and transparency, and costs throughput and fidelity. Several
+jobs are better served by something else.
+
+**Copying a large database out of Azure SQL wholesale.** Use a `.bacpac` produced *server-side*,
+so the extract never touches your connection:
+
+```bash
+az sql db export --resource-group <rg> --server <server> --name <database> \
+  --admin-user <admin> --admin-password <password> \
+  --storage-key-type StorageAccessKey --storage-key <key> \
+  --storage-uri https://<account>.blob.core.windows.net/<container>/<database>.bacpac
+```
+
+The database-to-blob leg runs inside Azure at Azure speed, and you download one compressed file
+instead of making a round trip per batch. For a full copy of a multi-gigabyte database this wins
+by a wide margin. You will need `sqlpackage` or SSMS to import it, and Microsoft's advice is to
+`CREATE DATABASE ... AS COPY OF` first and export the copy, because a `.bacpac` of a live database
+is not transactionally consistent either.
+
+**Copying a database between SQL Server instances you control.** Native `BACKUP`/`RESTORE` is
+faster and loses nothing — users, permissions, filegroups, statistics, the lot. Azure SQL Database
+cannot do it (Managed Instance can, with `COPY_ONLY` to a URL), which is the gap this tool grew
+out of, but on-premises it is the right answer.
+
+**Anything that needs a point-in-time snapshot.** Each table is read in its own statement, so rows
+in one table can be newer than rows in another. A resumed export widens that window further. If
+consistency across tables matters, copy or restore the database on the server first and dump the
+copy.
+
+**Users, roles and permissions.** Not captured, deliberately — see
+[what gets captured](#what-gets-captured) for the full list of what is left out. Script those with
+DacFx or `mssql-scripter`, or manage them separately.
+
+**Loading one large table as fast as physically possible.** `bcp` with a native-format file will
+beat this; it does one thing.
+
+**Schema version control or migrations.** A dumper is not a migration tool. Flyway, Liquibase or
+DacFx are.
+
+### When it is the right tool
+
+- Pulling *part* of a database — `--exclude-data` on a log table turned one 5 GB transfer into
+  1.4 GB, where a `.bacpac` is all-or-nothing.
+- Wanting to read, grep or diff what you dumped, or edit `manifest.json` before restoring.
+- Restoring somewhere with nothing installed: one static binary, no DacFx, no SSMS.
+- Restoring into a differently named database, or a subset of tables, without ceremony.
+- Checking that a restore actually matches its source, with `verify`.
 
 ## Notes and limits
 
