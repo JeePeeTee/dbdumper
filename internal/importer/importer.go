@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -177,9 +178,27 @@ func loadAllData(ctx context.Context, db *sql.DB, ar *archive.Reader, tables []m
 			exec(ctx, db, "DISABLE TRIGGER ALL ON "+t.QualifiedName(), opts)
 		}
 		defer func() {
+			// Deliberately detached from ctx: on Ctrl+C it is already
+			// cancelled, and re-enabling through it would fail for every
+			// table, leaving the target database with its constraints
+			// unchecked and its triggers off - a state this function created
+			// and must undo whether the load finished or not.
+			restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+			defer cancel()
+
+			var failed []string
 			for _, t := range tables {
-				exec(ctx, db, "ENABLE TRIGGER ALL ON "+t.QualifiedName(), opts)
-				exec(ctx, db, "ALTER TABLE "+t.QualifiedName()+" WITH CHECK CHECK CONSTRAINT ALL", opts)
+				if !execOK(restoreCtx, db, "ENABLE TRIGGER ALL ON "+t.QualifiedName(), opts) ||
+					!execOK(restoreCtx, db, "ALTER TABLE "+t.QualifiedName()+" WITH CHECK CHECK CONSTRAINT ALL", opts) {
+					failed = append(failed, t.Schema+"."+t.Name)
+				}
+			}
+			if len(failed) > 0 {
+				// Loud, because the database is left in a state the user did
+				// not ask for and cannot see without looking.
+				opts.warn("could not re-enable triggers or constraints on %d table(s): %s",
+					len(failed), strings.Join(failed, ", "))
+				opts.warn("those tables are left with constraints unchecked; re-run the import or fix them by hand")
 			}
 		}()
 	}
@@ -248,7 +267,14 @@ func loadAllData(ctx context.Context, db *sql.DB, ar *archive.Reader, tables []m
 }
 
 func exec(ctx context.Context, db *sql.DB, q string, opts Options) {
+	execOK(ctx, db, q, opts)
+}
+
+// execOK runs a best-effort statement and reports whether it succeeded.
+func execOK(ctx context.Context, db *sql.DB, q string, opts Options) bool {
 	if _, err := db.ExecContext(ctx, q); err != nil {
 		opts.warn("%s: %v", q, err)
+		return false
 	}
+	return true
 }
