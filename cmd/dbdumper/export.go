@@ -30,7 +30,9 @@ func runExport(ctx context.Context, args []string) error {
 	if *out == "" {
 		return errors.New("--out is required")
 	}
-	finishConn(fs, conn)
+	if err := finishConn(fs, conn); err != nil {
+		return err
+	}
 	if conn.DatabaseName() == "" {
 		return errors.New("--database is required")
 	}
@@ -71,8 +73,9 @@ func runExport(ctx context.Context, args []string) error {
 	if fi, err := os.Stat(*out); err == nil {
 		size = fi.Size()
 	}
-	logf("\nwrote %s (%s) - %d tables, %d rows in %s",
-		*out, humanBytes(size), res.Tables, res.Rows, res.Duration.Round(1e6))
+	logf("\nwrote %s (%s archive, %s of data) - %d tables, %d rows in %s",
+		*out, humanBytes(size), humanBytes(res.DataBytes),
+		res.Tables, res.Rows, res.Duration.Round(1e6))
 	return nil
 }
 

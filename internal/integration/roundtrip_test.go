@@ -116,7 +116,10 @@ func runRoundTrip(t *testing.T, noBulk bool) {
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
-	t.Logf("exported %d tables, %d rows", resA.Tables, resA.Rows)
+	t.Logf("exported %d tables, %d rows, %d bytes", resA.Tables, resA.Rows, resA.DataBytes)
+	if resA.DataBytes <= 0 {
+		t.Errorf("Result.DataBytes = %d; the dump is not empty, so it must be counted", resA.DataBytes)
+	}
 
 	arA, err := archive.Open(archiveA)
 	if err != nil {

@@ -114,10 +114,13 @@ func (o Options) warn(format string, args ...any) {
 
 // Result summarizes a completed dump.
 type Result struct {
-	Tables   int
-	Rows     int64
-	Bytes    int64
-	Duration time.Duration
+	Tables int
+	Rows   int64
+	// DataBytes is the uncompressed size of the JSONL written across all
+	// tables. It is not the archive's size on disk: the archive is deflated
+	// and also holds the manifest and the DDL scripts.
+	DataBytes int64
+	Duration  time.Duration
 }
 
 // Run performs the dump.
@@ -163,12 +166,13 @@ func Run(ctx context.Context, db *sql.DB, opts Options) (*Result, error) {
 				opts.log("  %-50s %10s", t.Schema+"."+t.Name, "(data skipped)")
 				continue
 			}
-			n, err := dumpTable(ctx, db, w, t, opts, i+1, len(dbm.Tables))
+			n, bytes, err := dumpTable(ctx, db, w, t, opts, i+1, len(dbm.Tables))
 			if err != nil {
 				return nil, fmt.Errorf("dump %s.%s: %w", t.Schema, t.Name, err)
 			}
 			t.RowCount = n
 			res.Rows += n
+			res.DataBytes += bytes
 		}
 	}
 
@@ -239,18 +243,20 @@ func warnUntrustedKeys(dbm *model.Database, opts Options) {
 	opts.warn("exclude the referencing tables' data too if you need referential integrity")
 }
 
-func dumpTable(ctx context.Context, db *sql.DB, w *archive.Writer, t *model.Table, opts Options, pos, total int) (int64, error) {
+// dumpTable writes one table's rows and reports how many, and how many
+// uncompressed bytes they took.
+func dumpTable(ctx context.Context, db *sql.DB, w *archive.Writer, t *model.Table, opts Options, pos, total int) (int64, int64, error) {
 	cols := dataColumns(*t)
 	if len(cols) == 0 {
 		opts.warn("%s.%s has no insertable columns; skipping data", t.Schema, t.Name)
-		return 0, nil
+		return 0, 0, nil
 	}
 	codec := sqlsrv.NewRowCodec(cols)
 
 	entry := archive.DataPath(t.Schema, t.Name)
 	out, err := w.Add(entry)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	bw := bufio.NewWriterSize(out, 1<<20)
 	cw := &countingWriter{w: bw}
@@ -266,13 +272,13 @@ func dumpTable(ctx context.Context, db *sql.DB, w *archive.Writer, t *model.Tabl
 		Columns []string `json:"columns"`
 	}{t.Schema + "." + t.Name, names}
 	if err := enc.Encode(header); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	query := "SELECT " + codec.SelectList() + " FROM " + t.QualifiedName()
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return 0, fmt.Errorf("%s: %w", query, err)
+		return 0, 0, fmt.Errorf("%s: %w", query, err)
 	}
 	defer rows.Close()
 
@@ -291,10 +297,10 @@ func dumpTable(ctx context.Context, db *sql.DB, w *archive.Writer, t *model.Tabl
 	buf := make([]any, 0, len(cols))
 	for rows.Next() {
 		if err := rows.Scan(codec.ScanDest()...); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		if err := enc.Encode(codec.Encode(buf)); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		n++
 
@@ -317,16 +323,16 @@ func dumpTable(ctx context.Context, db *sql.DB, w *archive.Writer, t *model.Tabl
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if err := bw.Flush(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	t.DataFile = entry
 	// A permanent line here replaces whatever transient line was last drawn.
 	opts.log("  %-50s %10d rows  %10s", t.Schema+"."+t.Name, n, humanBytes(cw.n))
-	return n, nil
+	return n, cw.n, nil
 }
 
 // countingWriter tallies the uncompressed bytes handed to the archive, so

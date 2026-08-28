@@ -86,7 +86,8 @@ Connection flags (both export and import):
   --trust-cert    accept a self-signed server certificate
   --protocol      pin transport: tcp | np (named pipes) | lpc (shared memory)
   --packet-size   TDS packet size 512..32767 (default 32767; -1 = driver default)
-  --dsn           full connection string; overrides all of the above
+  --dsn           full connection string; overrides the above except
+                  --database and --packet-size
 
 Run "dbdumper export -h" or "dbdumper import -h" for the rest.
 `)
@@ -95,7 +96,7 @@ Run "dbdumper export -h" or "dbdumper import -h" for the rest.
 // connFlags registers the shared connection flags on fs.
 func connFlags(fs *flag.FlagSet) *sqlsrv.ConnConfig {
 	c := &sqlsrv.ConnConfig{AppName: "dbdumper"}
-	fs.StringVar(&c.DSN, "dsn", "", "full connection string (overrides the other connection flags, except --database)")
+	fs.StringVar(&c.DSN, "dsn", "", "full connection string (overrides the other connection flags, except --database and --packet-size)")
 	fs.StringVar(&c.Server, "server", "localhost", `server: host, host\instance or host,port`)
 	fs.IntVar(&c.Port, "port", 0, "TCP port (default: instance default)")
 	fs.StringVar(&c.Database, "database", "", "database name; with --dsn, overrides the database in it")
@@ -109,16 +110,30 @@ func connFlags(fs *flag.FlagSet) *sqlsrv.ConnConfig {
 	return c
 }
 
-func finishConn(fs *flag.FlagSet, c *sqlsrv.ConnConfig) {
+func finishConn(fs *flag.FlagSet, c *sqlsrv.ConnConfig) error {
 	explicit := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 
 	// A password on the command line ends up in shell history and in the
 	// process list, so allow it to arrive out of band instead.
+	passwordFromEnv := false
 	if c.Password == "" {
-		c.Password = os.Getenv("DBDUMPER_PASSWORD")
+		if env := os.Getenv("DBDUMPER_PASSWORD"); env != "" {
+			c.Password, passwordFromEnv = env, true
+		}
 	}
-	if c.User == "" && c.Password == "" {
+
+	// No login name means Windows authentication, and a password without one
+	// is unusable either way: the connection string builder needs a user to
+	// attach it to. Which mistake it is decides how loudly to complain.
+	if c.User == "" {
+		if c.Password != "" {
+			if !passwordFromEnv {
+				return errors.New("--password was given without --user; add --user, or drop --password to use Windows authentication")
+			}
+			warnf("DBDUMPER_PASSWORD is set but --user is not; ignoring it and using Windows authentication")
+			c.Password = ""
+		}
 		c.Trusted = true
 	}
 
@@ -128,6 +143,7 @@ func finishConn(fs *flag.FlagSet, c *sqlsrv.ConnConfig) {
 	if c.DSN != "" && c.Database != "" {
 		*c = c.WithDatabase(c.Database)
 	}
+	*c = c.EnsurePacketSize()
 
 	// Azure SQL mandates encryption and presents a certificate that chains to
 	// a public root, so the local-server defaults are wrong in both directions.
@@ -139,6 +155,7 @@ func finishConn(fs *flag.FlagSet, c *sqlsrv.ConnConfig) {
 			c.TrustCert = false
 		}
 	}
+	return nil
 }
 
 // stringList is a repeatable flag that also accepts comma-separated values.
