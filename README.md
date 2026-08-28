@@ -158,8 +158,10 @@ to read it and does not try. Get the plaintext from whatever code in your app de
 ### export
 
 ```
---out <file>        archive to write                           (required)
---force             overwrite --out if it exists
+--out <file>           archive to write                        (required)
+--force                overwrite --out if it exists
+--resume               continue an export interrupted earlier
+--restart              discard an interrupted export and start over
 --schema-only          definitions only, no rows
 --include <glob>       only these tables, glob on schema.table, repeatable
 --exclude <glob>       omit these tables entirely, definition included, repeatable
@@ -187,6 +189,42 @@ keys those are:
 ```
 
 Exclude the referencing tables' data too if you need referential integrity.
+
+### Resuming an interrupted export
+
+Pulling several gigabytes across the internet takes long enough that something
+will eventually interrupt it. An export writes its tables to a work directory
+next to the output — `<out>.dbdump.part` — and assembles the archive only once
+every table is present, so a run that dies can be continued instead of repeated:
+
+```bash
+dbdumper export --server myserver.database.windows.net --database appdb --user "appuser@myserver" --out appdb.dbdump
+# ...interrupted after 300 of 400 tables...
+
+dbdumper export --server myserver.database.windows.net --database appdb --user "appuser@myserver" --out appdb.dbdump --resume
+resuming: 300 table(s) already dumped in appdb.dbdump.part
+```
+
+Finding a work directory without being told what to do about it is an error, not
+a guess: pass `--resume` to continue it or `--restart` to throw it away.
+
+A table counts as done only once its data has been flushed and its state file
+written, so a run killed mid-table simply redoes that table. Resuming is refused
+if the source database's name or schema no longer matches what the interrupted
+run saw, since mixing rows read before a schema change with rows read after it
+would produce an archive that never existed.
+
+Two things to know:
+
+- **A resumed dump is not a point-in-time snapshot.** Tables carried over hold
+  the rows they had when the first run read them. Neither is an ordinary export,
+  which reads each table in its own statement — but a resume widens the window
+  from minutes to however long passed between the runs.
+- **Disk.** The work directory holds the table data already compressed, so it is
+  about the size of the finished archive rather than the size of the rows. During
+  packaging each spooled table is deleted as soon as it is safely inside the
+  archive, so the peak is roughly one archive plus the largest single table, not
+  two archives.
 
 ### Progress display
 

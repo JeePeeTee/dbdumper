@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/JeePeeTee/dbdumper/internal/model"
 )
@@ -77,6 +78,30 @@ func Create(p string) (*Writer, error) {
 // finished automatically.
 func (w *Writer) Add(name string) (io.Writer, error) {
 	return w.zw.CreateHeader(&zip.FileHeader{Name: name, Method: zip.Deflate})
+}
+
+// RawEntry describes data that is already DEFLATE-compressed, so it can be
+// placed into the archive without being compressed a second time.
+type RawEntry struct {
+	Name             string
+	UncompressedSize uint64
+	CompressedSize   uint64
+	CRC32            uint32
+}
+
+// AddRaw begins an entry whose bytes are written already compressed. The
+// caller must write exactly CompressedSize bytes of a raw DEFLATE stream
+// matching the CRC and length given, since the header is written from those
+// values rather than derived from the data.
+func (w *Writer) AddRaw(e RawEntry) (io.Writer, error) {
+	return w.zw.CreateRaw(&zip.FileHeader{
+		Name:               e.Name,
+		Method:             zip.Deflate,
+		Modified:           time.Now(),
+		CRC32:              e.CRC32,
+		UncompressedSize64: e.UncompressedSize,
+		CompressedSize64:   e.CompressedSize,
+	})
 }
 
 // AddJSON writes v as indented JSON.

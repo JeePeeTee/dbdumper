@@ -19,6 +19,8 @@ func runExport(ctx context.Context, args []string) error {
 	out := fs.String("out", "", "archive to write (required)")
 	schemaOnly := fs.Bool("schema-only", false, "dump definitions but no rows")
 	force := fs.Bool("force", false, "overwrite --out if it already exists")
+	resume := fs.Bool("resume", false, "continue an export interrupted earlier")
+	restart := fs.Bool("restart", false, "discard an interrupted export and start over")
 	var include, exclude, excludeData stringList
 	fs.Var(&include, "include", "only these tables; glob on schema.table, repeatable")
 	fs.Var(&exclude, "exclude", "omit these tables entirely, definition included; repeatable")
@@ -36,6 +38,11 @@ func runExport(ctx context.Context, args []string) error {
 	if conn.DatabaseName() == "" {
 		return errors.New("--database is required")
 	}
+	if *resume && *restart {
+		return errors.New("--resume and --restart are mutually exclusive")
+	}
+	// A finished archive is only in the way when this run will actually
+	// finish; an interrupted one is expected to overwrite it eventually.
 	if !*force {
 		if _, err := os.Stat(*out); err == nil {
 			return fmt.Errorf("%s already exists (pass --force to overwrite)", *out)
@@ -61,6 +68,8 @@ func runExport(ctx context.Context, args []string) error {
 		Include:          include,
 		Exclude:          exclude,
 		ExcludeData:      excludeData,
+		Resume:           *resume,
+		Restart:          *restart,
 		Log:              logf,
 		Progress:         showProgress,
 		Warn:             warnf,
