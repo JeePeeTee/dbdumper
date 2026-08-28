@@ -143,6 +143,32 @@ ORDER BY SUM(CASE WHEN ps.index_id IN (0,1) THEN ps.used_page_count ELSE 0 END) 
 Log and audit tables are usually the largest and the least worth copying. Use `--exclude-data` to
 keep their definitions without paying for their rows.
 
+#### When a connection is refused
+
+Azure SQL authenticates against the *target database*, not the server, and reports a wrong
+password, a database that does not exist, and a login with no user in that database all as
+`Login failed for user` (18456). That is deliberate — telling them apart would reveal which
+databases exist — but it leaves you with no idea which of the three to fix, so dbdumper prints
+the three candidates and the SQL for the one people hit most:
+
+```
+error: connect to sqlserver://appuser%40myserver:***@myserver.database.windows.net?database=appdb: mssql: Login failed for user 'appuser'. (18456)
+
+Azure SQL authenticates against the target database, and reports all three of these
+as the same error. Any one of them could be the cause:
+  1. The password is wrong.
+  2. The database "appdb" does not exist on this server.
+  3. The login "appuser@myserver" has no user in "appdb".
+     ...
+         CREATE USER [appuser] FOR LOGIN [appuser];
+```
+
+The quickest way to split them is to run the same credentials against a database the login can
+definitely reach with `--schema-only`: if that works, the password is not the problem.
+
+Firewall rejections (40615), a paused serverless database (40613) and an unroutable login (40532)
+are distinguished by Azure, and get their own one-line explanations.
+
 If your credentials live in a .NET `app.config`, map the keys straight across:
 
 | appSettings key | flag |
