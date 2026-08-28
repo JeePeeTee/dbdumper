@@ -1,6 +1,9 @@
 package model
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestQuote(t *testing.T) {
 	cases := map[string]string{
@@ -204,5 +207,43 @@ func TestSequenceDDL(t *testing.T) {
 		"MINVALUE 1 MAXVALUE 999999 NO CYCLE CACHE 20"
 	if got := s.CreateDDL(); got != want {
 		t.Errorf("\n got %s\nwant %s", got, want)
+	}
+}
+
+// TestColumnstoreIndexHasNoSortOrder - SQL Server rejects CREATE COLUMNSTORE
+// INDEX outright when a column carries ASC or DESC: "specifying sort order
+// (ASC or DESC) is not allowed when creating a columnstore index".
+func TestColumnstoreIndexHasNoSortOrder(t *testing.T) {
+	tbl := Table{Schema: "dbo", Name: "Fact"}
+
+	nc := Index{
+		Name: "IX_Fact_CS", TypeDes: "NONCLUSTERED COLUMNSTORE",
+		Columns: []IndexColumn{{Name: "a"}, {Name: "b", IsDescending: true}},
+	}
+	got := nc.CreateIndexDDL(tbl)
+	want := "CREATE NONCLUSTERED COLUMNSTORE INDEX [IX_Fact_CS] ON [dbo].[Fact] ([a], [b])"
+	if got != want {
+		t.Errorf("\n got %s\nwant %s", got, want)
+	}
+	for _, bad := range []string{" ASC", " DESC"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("columnstore DDL must not carry a sort order, got %s", got)
+		}
+	}
+
+	// A clustered columnstore covers the whole table and names no columns.
+	cc := Index{
+		Name: "IX_Fact_CCS", TypeDes: "CLUSTERED COLUMNSTORE",
+		Columns: []IndexColumn{{Name: "a"}},
+	}
+	if got, want := cc.CreateIndexDDL(tbl),
+		"CREATE CLUSTERED COLUMNSTORE INDEX [IX_Fact_CCS] ON [dbo].[Fact]"; got != want {
+		t.Errorf("\n got %s\nwant %s", got, want)
+	}
+
+	// A normal index still gets its sort order.
+	rb := Index{Name: "IX_Plain", TypeDes: "NONCLUSTERED", Columns: []IndexColumn{{Name: "a", IsDescending: true}}}
+	if !strings.Contains(rb.CreateIndexDDL(tbl), "[a] DESC") {
+		t.Errorf("rowstore index lost its sort order: %s", rb.CreateIndexDDL(tbl))
 	}
 }

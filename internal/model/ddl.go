@@ -114,6 +114,17 @@ func indexKeyList(cols []IndexColumn, included bool) string {
 	return strings.Join(parts, ", ")
 }
 
+// plainColumnList renders key columns without a sort direction.
+func plainColumnList(cols []IndexColumn) string {
+	parts := make([]string, 0, len(cols))
+	for _, ic := range cols {
+		if !ic.IsIncluded {
+			parts = append(parts, Quote(ic.Name))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
 func (ix Index) withOptions(base string) string {
 	var opts []string
 	if ix.IgnoreDupKey {
@@ -156,7 +167,9 @@ func (ix Index) CreateIndexDDL(table Table) string {
 		}
 		s := fmt.Sprintf("CREATE %s COLUMNSTORE INDEX %s ON %s", clustering, Quote(ix.Name), table.QualifiedName())
 		if clustering == "NONCLUSTERED" {
-			s += " (" + indexKeyList(ix.Columns, false) + ")"
+			// Bare column names: a columnstore index stores no sort order, and
+			// SQL Server rejects the statement outright if ASC or DESC appears.
+			s += " (" + plainColumnList(ix.Columns) + ")"
 		}
 		return s
 	}
