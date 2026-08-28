@@ -172,6 +172,9 @@ func Open(ctx context.Context, c ConnConfig) (*sql.DB, error) {
 	db.SetMaxIdleConns(maxConns)
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
+		if hint := ConnectHint(c, err); hint != "" {
+			return nil, fmt.Errorf("connect to %s: %w\n\n%s", c.Redacted(), err, hint)
+		}
 		return nil, fmt.Errorf("connect to %s: %w", c.Redacted(), err)
 	}
 	return db, nil
@@ -255,6 +258,31 @@ func setADOParam(dsn, key, value string, aliases ...string) string {
 		out = append(out, p)
 	}
 	return strings.Join(append(out, key+"="+value), ";")
+}
+
+// LoginName reports the SQL login this config authenticates as, if it can tell.
+// Windows authentication has none, and returns "".
+func (c ConnConfig) LoginName() string {
+	if c.DSN == "" {
+		return c.User
+	}
+	if u, err := url.Parse(c.DSN); err == nil && u.Scheme == "sqlserver" {
+		if u.User != nil && u.User.Username() != "" {
+			return u.User.Username()
+		}
+		return u.Query().Get("user id")
+	}
+	for _, p := range strings.Split(c.DSN, ";") {
+		kv := strings.SplitN(p, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(kv[0])) {
+		case "user id", "user", "uid":
+			return strings.TrimSpace(kv[1])
+		}
+	}
+	return ""
 }
 
 // DatabaseName reports the database this config points at, if it can tell.
