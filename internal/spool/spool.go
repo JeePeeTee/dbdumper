@@ -13,6 +13,8 @@ package spool
 
 import (
 	"compress/flate"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,7 +28,11 @@ import (
 )
 
 // FormatVersion guards against a work directory left by an incompatible build.
-const FormatVersion = 1
+//
+// 2: spool files are named after the piece they hold rather than by position.
+// A version 1 directory cannot be resumed, because its names mean something
+// else and adopting them would mix two numbering schemes in one directory.
+const FormatVersion = 2
 
 // Meta identifies the export a work directory belongs to.
 type Meta struct {
@@ -153,13 +159,13 @@ func (s *Spool) Completed() (map[string]TableState, error) {
 // remaining chunks with the boundaries the first run used. Boundaries come from
 // a sample of live data, so recomputing them would shift the ranges and leave
 // gaps between chunks written before the interruption and chunks written after.
-func (s *Spool) SavePlan(tableIndex int, v any) error {
-	return writeJSONAtomic(s.planPath(tableIndex), v)
+func (s *Spool) SavePlan(identity string, v any) error {
+	return writeJSONAtomic(s.planPath(identity), v)
 }
 
 // LoadPlan reads back a plan saved earlier, reporting whether there was one.
-func (s *Spool) LoadPlan(tableIndex int, v any) (bool, error) {
-	err := readJSON(s.planPath(tableIndex), v)
+func (s *Spool) LoadPlan(identity string, v any) (bool, error) {
+	err := readJSON(s.planPath(identity), v)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
@@ -169,8 +175,24 @@ func (s *Spool) LoadPlan(tableIndex int, v any) (bool, error) {
 	return true, nil
 }
 
-func (s *Spool) planPath(tableIndex int) string {
-	return filepath.Join(s.dir, tablesDir, fmt.Sprintf("%05d.plan%s", tableIndex, stateSuffix))
+func (s *Spool) planPath(identity string) string {
+	return filepath.Join(s.dir, tablesDir, fileBase(identity)+".plan"+stateSuffix)
+}
+
+// fileBase turns a piece's identity into the stem of its files.
+//
+// Naming files after what they hold, rather than after the position of the
+// table in a run's list, is what makes a work directory safe to resume under
+// different options. Position is not a property of the data: excluding one
+// table's rows, or splitting a table into a different number of ranges, shifts
+// every position after it, and the next run then writes over files the last one
+// committed under a name that no longer means the same thing.
+//
+// The digest is truncated to 64 bits, which over any realistic number of tables
+// is far below the chance of the disk lying about the write.
+func fileBase(identity string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(identity)))
+	return hex.EncodeToString(sum[:8])
 }
 
 // TableWriter accumulates one table's rows.
@@ -184,10 +206,11 @@ type TableWriter struct {
 	finished bool
 }
 
-// NewTable starts spooling a table. Index only names the files; a resume
-// matches on identity, so tables may be visited in any order.
-func (s *Spool) NewTable(index int, identity, entry string) (*TableWriter, error) {
-	rel := filepath.Join(tablesDir, fmt.Sprintf("%05d%s", index, dataSuffix))
+// NewTable starts spooling a piece. Its files are named after its identity, so
+// pieces may be visited in any order and a resume under different options
+// cannot land on a file that belongs to something else.
+func (s *Spool) NewTable(identity, entry string) (*TableWriter, error) {
+	rel := filepath.Join(tablesDir, fileBase(identity)+dataSuffix)
 	f, err := os.Create(filepath.Join(s.dir, rel))
 	if err != nil {
 		return nil, err
