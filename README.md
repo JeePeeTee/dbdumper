@@ -191,6 +191,7 @@ to read it and does not try. Get the plaintext from whatever code in your app de
 --force                overwrite --out if it exists
 --resume               continue an export interrupted earlier
 --restart              discard an interrupted export and start over
+--parallel <n>         tables read concurrently                (default 4)
 --schema-only          definitions only, no rows
 --include <glob>       only these tables, glob on schema.table, repeatable
 --exclude <glob>       omit these tables entirely, definition included, repeatable
@@ -219,6 +220,34 @@ keys those are:
 ```
 
 Exclude the referencing tables' data too if you need referential integrity.
+
+### Reading tables in parallel
+
+Tables are read concurrently, each on its own connection, and spooled to its own
+file. `--parallel` sets how many at once.
+
+How much this buys depends on where the time goes, and the ceiling is the
+**largest single table** — parallelism across tables cannot split one. On the
+403-table database this was developed against, one table is 72% of the work:
+
+| `--parallel` | time |
+| ---: | ---: |
+| 1 | 36.1s |
+| 2 | 24.4s |
+| 4 | 24.6s |
+| 6 | 25.2s |
+
+Two workers collect the whole gain and more add nothing, because everything else
+finishes long before the big table does. Over a network the picture differs:
+each connection is latency-bound rather than CPU-bound, so more of them keep
+paying off until the link saturates.
+
+Output does not depend on the worker count. Tables are written to the archive in
+catalogue order however they were read, so an archive produced with `--parallel 8`
+is byte-identical to one produced with `--parallel 1`.
+
+Work is scheduled largest-first, since the run cannot end before its biggest
+table does and starting that one last would leave the other workers idle.
 
 ### Taking part of a table
 
