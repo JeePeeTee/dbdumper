@@ -329,7 +329,6 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 	// nothing and resumed ones already did, so neither belongs in the total.
 	var pieces []piece
 	var totalBytes int64
-	nextSpoolIndex := 0
 
 	for i := range dbm.Tables {
 		t := &dbm.Tables[i]
@@ -339,14 +338,10 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 			continue
 		}
 
-		chunks, key := planFor(ctx, in, sp, t, i, workers, opts)
-		base := nextSpoolIndex
-		// Reserve a spool slot per piece up front, so the numbering is stable
-		// across a resume even if a table is skipped on the second run.
-		nextSpoolIndex += max(1, len(chunks))
+		chunks, key := planFor(ctx, in, sp, t, workers, opts)
 
 		if len(chunks) == 0 {
-			p := piece{tableIndex: i, spoolIndex: base, pos: i + 1, t: t,
+			p := piece{tableIndex: i, pos: i + 1, t: t,
 				estRows: t.EstimatedRows, estBytes: progressBytes(t), schedBytes: t.EstimatedBytes}
 			if st, done := states[strings.ToLower(p.label())]; done {
 				adoptResumed(t, st, res, opts)
@@ -361,7 +356,7 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 		t.DataFiles = make([]string, len(chunks))
 		for k := range chunks {
 			p := piece{
-				tableIndex: i, spoolIndex: base + k, pos: i + 1, t: t,
+				tableIndex: i, pos: i + 1, t: t,
 				chunk: &chunks[k], key: key.Column.Name,
 				estRows:    t.EstimatedRows / int64(len(chunks)),
 				estBytes:   progressBytes(t) / int64(len(chunks)),
@@ -474,10 +469,11 @@ func adoptResumed(t *model.Table, st spool.TableState, res *Result, opts Options
 // would fall into no chunk at all, or into two. The plan is therefore saved
 // with the work directory and read back rather than recomputed.
 func planFor(ctx context.Context, in *sqlsrv.Introspector, sp *spool.Spool,
-	t *model.Table, tableIndex, workers int, opts Options) ([]sqlsrv.Chunk, sqlsrv.ChunkKey) {
+	t *model.Table, workers int, opts Options) ([]sqlsrv.Chunk, sqlsrv.ChunkKey) {
 
+	planKey := strings.ToLower(t.Schema + "." + t.Name)
 	var saved savedPlan
-	if ok, err := sp.LoadPlan(tableIndex, &saved); err != nil {
+	if ok, err := sp.LoadPlan(planKey, &saved); err != nil {
 		opts.warn("could not read the chunk plan for %s.%s (%v); reading it in one piece",
 			t.Schema, t.Name, err)
 		return nil, sqlsrv.ChunkKey{}
@@ -514,7 +510,7 @@ func planFor(ctx context.Context, in *sqlsrv.Introspector, sp *spool.Spool,
 	if err != nil || len(chunks) == 0 {
 		return nil, sqlsrv.ChunkKey{}
 	}
-	if err := sp.SavePlan(tableIndex, newSavedPlan(key, chunks)); err != nil {
+	if err := sp.SavePlan(planKey, newSavedPlan(key, chunks)); err != nil {
 		opts.warn("could not record the chunk plan for %s.%s (%v); a resume will read it in one piece",
 			t.Schema, t.Name, err)
 	}
@@ -643,24 +639,10 @@ func fingerprint(database string, dbm *model.Database) string {
 // succeed, but it leaves the target database referentially inconsistent, so it
 // should never be a silent consequence.
 func warnUntrustedKeys(dbm *model.Database, opts Options) {
-	skipped := map[string]bool{}
-	for _, t := range dbm.Tables {
-		if t.PartialData() {
-			skipped[strings.ToLower(t.Schema+"."+t.Name)] = true
-		}
-	}
-	if len(skipped) == 0 {
-		return
-	}
-	var affected []string
-	for _, t := range dbm.Tables {
-		for _, fk := range t.ForeignKeys {
-			if skipped[strings.ToLower(fk.ReferencedSchema+"."+fk.ReferencedTable)] && !t.PartialData() {
-				affected = append(affected, fmt.Sprintf("%s on %s.%s -> %s.%s",
-					fk.Name, t.Schema, t.Name, fk.ReferencedSchema, fk.ReferencedTable))
-			}
-		}
-	}
+	// The same rule the DDL is generated from, rather than a second copy of it:
+	// a warning that disagreed with what the restore does would be worse than
+	// no warning at all.
+	affected := plan.UntrustedForeignKeys(dbm)
 	if len(affected) == 0 {
 		return
 	}
@@ -680,8 +662,7 @@ func warnUntrustedKeys(dbm *model.Database, opts Options) {
 // uncompressed bytes they took.
 // piece is one unit of reading: a whole table, or one range of a split table.
 type piece struct {
-	tableIndex int // position in dbm.Tables, and the spool file family
-	spoolIndex int // unique per piece, so chunks do not share a spool file
+	tableIndex int // position in dbm.Tables
 	pos        int // 1-based table position, for display
 	t          *model.Table
 	chunk      *sqlsrv.Chunk // nil for a table read in one piece
@@ -733,7 +714,7 @@ func (p piece) entry() string {
 func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, pc piece,
 	opts Options, total int, tr *tracker) (spool.TableState, error) {
 
-	index, t, pos := pc.spoolIndex, pc.t, pc.pos
+	t, pos := pc.t, pc.pos
 
 	var none spool.TableState
 	cols := dataColumns(*t)
@@ -744,7 +725,7 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, pc piece,
 	codec := sqlsrv.NewRowCodec(cols)
 
 	entry := pc.entry()
-	tw, err := sp.NewTable(index, strings.ToLower(pc.label()), entry)
+	tw, err := sp.NewTable(strings.ToLower(pc.label()), entry)
 	if err != nil {
 		return none, err
 	}

@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -87,6 +88,90 @@ func TestResumeObeysTheSecondRunsExclusions(t *testing.T) {
 	})
 }
 
+// TestResumeUnderDifferentOptionsKeepsItsData guards the naming of spool files.
+//
+// The work directory is written by one run and read by another, and the second
+// run may be given different options. When files were named after a table's
+// position in the run's list, excluding one table's rows shifted every position
+// after it, and the second run wrote over data - and over the state file
+// describing it - that the first run had committed under the same name. The
+// export then failed and the resumable state was gone.
+//
+// Excluding the first table in model order is the sharpest case: it shifts
+// everything.
+func TestResumeUnderDifferentOptionsKeepsItsData(t *testing.T) {
+	ctx := context.Background()
+	src, out := interruptedExport(t)
+
+	res, err := export.Run(ctx, src, export.Options{
+		Out:              out,
+		Resume:           true,
+		ExcludeData:      []string{"dbo.AllTypes"},
+		Parallel:         1,
+		ProgressInterval: -1,
+		Warn:             warnf(t),
+	})
+	if err != nil {
+		t.Fatalf("resuming with a different --exclude-data failed: %v", err)
+	}
+	t.Logf("resumed run: %d tables, %d rows", res.Tables, res.Rows)
+
+	ar, err := archive.Open(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	// Every packaged table must hold its own rows, in the right number. A
+	// shifted name shows up here as one table carrying another's data.
+	checked := 0
+	for _, tb := range ar.Manifest.Database.Tables {
+		name := tb.Schema + "." + tb.Name
+		if tb.DataSkipped {
+			if len(tb.DataEntries()) != 0 {
+				t.Errorf("%s was excluded but still points at %v", name, tb.DataEntries())
+			}
+			continue
+		}
+		var want int64
+		if err := src.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+tb.QualifiedName()).Scan(&want); err != nil {
+			t.Fatal(err)
+		}
+		if tb.RowCount != want {
+			t.Errorf("%s: manifest says %d rows, the database has %d", name, tb.RowCount, want)
+		}
+		for _, entry := range tb.DataEntries() {
+			// The header inside the entry names the table the rows came from,
+			// which is what catches an entry filled from the wrong spool file.
+			if got := headerTable(t, ar, entry); !strings.EqualFold(got, name) {
+				t.Errorf("%s: entry %s holds rows headed %q", name, entry, got)
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no data entries were checked; the archive is not what this test assumes")
+	}
+}
+
+// headerTable reads the table name out of a data entry's first line.
+func headerTable(t *testing.T, ar *archive.Reader, entry string) string {
+	t.Helper()
+	rc, err := ar.OpenEntry(entry)
+	if err != nil {
+		t.Fatalf("open %s: %v", entry, err)
+	}
+	defer rc.Close()
+
+	var hdr struct {
+		Table string `json:"table"`
+	}
+	if err := json.NewDecoder(rc).Decode(&hdr); err != nil {
+		t.Fatalf("read the header of %s: %v", entry, err)
+	}
+	return hdr.Table
+}
+
 // assertNoDataEntries fails if the archive carries any table data at all. It
 // reads the zip directly rather than going through the manifest, because the
 // point is what is in the file, not what the manifest admits to.
@@ -123,6 +208,12 @@ func (l *logCapture) record(format string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *logCapture) text() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, "\n")
 }
 
 // mustHaveResumed guards against the test passing for the wrong reason. An

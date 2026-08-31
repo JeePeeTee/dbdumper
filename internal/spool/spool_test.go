@@ -21,9 +21,9 @@ func newSpool(t *testing.T) (*Spool, Meta) {
 }
 
 // spoolOne writes a table and commits it, returning what packaging would need.
-func spoolOne(t *testing.T, s *Spool, index int, identity, entry string, payload []byte) TableState {
+func spoolOne(t *testing.T, s *Spool, identity, entry string, payload []byte) TableState {
 	t.Helper()
-	w, err := s.NewTable(index, identity, entry)
+	w, err := s.NewTable(identity, entry)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestSpooledDataRoundTrips(t *testing.T) {
 	s, _ := newSpool(t)
 	payload := []byte(strings.Repeat(`{"a":1,"b":"text"}`+"\n", 1000))
 
-	st := spoolOne(t, s, 0, "dbo.t", "data/dbo.t.jsonl", payload)
+	st := spoolOne(t, s, "dbo.t", "data/dbo.t.jsonl", payload)
 
 	if st.UncompressedSize != uint64(len(payload)) {
 		t.Errorf("UncompressedSize = %d, want %d", st.UncompressedSize, len(payload))
@@ -74,10 +74,10 @@ func TestSpooledDataRoundTrips(t *testing.T) {
 // redone, or the archive would contain a truncated one.
 func TestUncommittedTableIsNotResumed(t *testing.T) {
 	s, _ := newSpool(t)
-	spoolOne(t, s, 0, "dbo.done", "data/dbo.done.jsonl", []byte("row\n"))
+	spoolOne(t, s, "dbo.done", "data/dbo.done.jsonl", []byte("row\n"))
 
 	// Start a second table and walk away, as a kill -9 would.
-	w, err := s.NewTable(1, "dbo.halfway", "data/dbo.halfway.jsonl")
+	w, err := s.NewTable("dbo.halfway", "data/dbo.halfway.jsonl")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestUncommittedTableIsNotResumed(t *testing.T) {
 // not, the record has to be distrusted.
 func TestTruncatedDataIsNotResumed(t *testing.T) {
 	s, _ := newSpool(t)
-	st := spoolOne(t, s, 0, "dbo.t", "data/dbo.t.jsonl", []byte(strings.Repeat("row\n", 500)))
+	st := spoolOne(t, s, "dbo.t", "data/dbo.t.jsonl", []byte(strings.Repeat("row\n", 500)))
 
 	f := filepath.Join(s.Dir(), st.File)
 	if err := os.Truncate(f, int64(st.CompressedSize)-10); err != nil {
@@ -182,7 +182,7 @@ func TestFingerprintTracksShapeNotOrder(t *testing.T) {
 
 func TestCreateClearsWhatWasThere(t *testing.T) {
 	s, m := newSpool(t)
-	spoolOne(t, s, 0, "dbo.t", "data/dbo.t.jsonl", []byte("row\n"))
+	spoolOne(t, s, "dbo.t", "data/dbo.t.jsonl", []byte("row\n"))
 
 	again, err := Create(s.Dir(), m)
 	if err != nil {
@@ -199,7 +199,7 @@ func TestCreateClearsWhatWasThere(t *testing.T) {
 
 func TestDiscardRemovesEverything(t *testing.T) {
 	s, _ := newSpool(t)
-	spoolOne(t, s, 0, "dbo.t", "data/dbo.t.jsonl", []byte("row\n"))
+	spoolOne(t, s, "dbo.t", "data/dbo.t.jsonl", []byte("row\n"))
 	if err := s.Discard(); err != nil {
 		t.Fatal(err)
 	}
