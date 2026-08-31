@@ -92,9 +92,9 @@ an honest record of what will happen rather than a rendering that might drift.
 
 ### No install, no .NET
 
-One statically linked binary, 10.3 MB, on Windows and Linux. SqlPackage
-needs a .NET runtime and its own installation. Useful in a container, a CI job,
-or on a locked-down jump box.
+One statically linked binary, around 7 MB, for Windows, Linux and macOS on both
+amd64 and arm64. SqlPackage needs a .NET runtime and its own installation.
+Useful in a container, a CI job, or on a locked-down jump box.
 
 ### Progress you can plan around
 

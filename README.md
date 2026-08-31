@@ -8,6 +8,20 @@ without DacFx or SSMS.
 It is not the right tool for every job — see [when not to use this](#when-not-to-use-this) before
 reaching for it on a large cloud database.
 
+## Install
+
+Download a binary for your platform from
+[the latest release](https://github.com/JeePeeTee/dbdumper/releases/latest) — one static file,
+around 7 MB, nothing to install alongside it. `SHA256SUMS` is published with each release.
+
+With a Go toolchain to hand:
+
+```bash
+go install github.com/JeePeeTee/dbdumper/cmd/dbdumper@latest
+```
+
+Or from a clone:
+
 ```bash
 go build -o bin/dbdumper ./cmd/dbdumper
 ```

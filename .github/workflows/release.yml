@@ -1,0 +1,113 @@
+name: Release
+
+# Cutting a release is: git tag v0.1.0 && git push origin v0.1.0
+#
+# Binaries are published as release assets rather than committed. Git keeps
+# every version of every file forever, so a 10 MB executable per release would
+# be added to every clone permanently, and could not be taken back out without
+# rewriting history.
+on:
+  push:
+    tags: ["v*"]
+
+# The default token is read-only; creating a release needs to write.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # A tag that does not build, or does not pass, should not become a
+      # release. CI has already run this on the commit, but a tag can be moved
+      # or pushed from a stale branch, so it is checked again here.
+      - name: Vet
+        run: go vet ./...
+
+      # Unit suite only: the integration tests skip themselves unless
+      # DBDUMPER_TEST_DSN points at a SQL Server, and a runner has none.
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          mkdir -p dist
+
+          # CGO is off so each binary is static and needs nothing installed on
+          # the target - the point of shipping one file. Nothing in the tool
+          # needs cgo: the SQL Server driver is pure Go, and the Windows console
+          # calls go through syscall.
+          for target in \
+            windows/amd64 windows/arm64 \
+            linux/amd64   linux/arm64 \
+            darwin/amd64  darwin/arm64
+          do
+            os="${target%/*}"
+            arch="${target#*/}"
+            name="dbdumper_${version}_${os}_${arch}"
+            bin="dbdumper"
+            [ "$os" = "windows" ] && bin="dbdumper.exe"
+
+            mkdir -p "dist/$name"
+            # -trimpath keeps build paths out of the binary, and -X stamps the
+            # tag into the version the tool reports for itself.
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=${version}" \
+              -o "dist/$name/$bin" \
+              ./cmd/dbdumper
+            cp README.md LICENSE "dist/$name/"
+
+            if [ "$os" = "windows" ]; then
+              (cd dist && zip -qr "$name.zip" "$name")
+            else
+              (cd dist && tar czf "$name.tar.gz" "$name")
+            fi
+            rm -rf "dist/$name"
+          done
+
+          # Listed explicitly so the sums file cannot end up hashing itself.
+          (cd dist && sha256sum *.zip *.tar.gz > SHA256SUMS)
+          ls -l dist
+
+      # Sanity check that the stamped version is the tag, so a release cannot
+      # ship a binary that reports "dev".
+      - name: Check the stamped version
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build -ldflags "-X main.version=${GITHUB_REF_NAME}" \
+            -o /tmp/dbdumper ./cmd/dbdumper
+          got="$(/tmp/dbdumper version)"
+          echo "reported: $got"
+          [ "$got" = "dbdumper ${GITHUB_REF_NAME}" ]
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A tag like v0.2.0-rc1 is marked a prerelease, so it does not become
+          # the "latest" release people are pointed at.
+          prerelease=""
+          case "$GITHUB_REF_NAME" in
+            *-*) prerelease="--prerelease" ;;
+          esac
+
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+            $prerelease
