@@ -347,13 +347,13 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 
 		if len(chunks) == 0 {
 			p := piece{tableIndex: i, spoolIndex: base, pos: i + 1, t: t,
-				estRows: t.EstimatedRows, estBytes: t.EstimatedBytes}
+				estRows: t.EstimatedRows, estBytes: progressBytes(t), schedBytes: t.EstimatedBytes}
 			if st, done := states[strings.ToLower(p.label())]; done {
 				adoptResumed(t, st, res, opts)
 				continue
 			}
 			pieces = append(pieces, p)
-			totalBytes += t.EstimatedBytes
+			totalBytes += p.estBytes
 			continue
 		}
 
@@ -363,8 +363,9 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 			p := piece{
 				tableIndex: i, spoolIndex: base + k, pos: i + 1, t: t,
 				chunk: &chunks[k], key: key.Column.Name,
-				estRows:  t.EstimatedRows / int64(len(chunks)),
-				estBytes: t.EstimatedBytes / int64(len(chunks)),
+				estRows:    t.EstimatedRows / int64(len(chunks)),
+				estBytes:   progressBytes(t) / int64(len(chunks)),
+				schedBytes: t.EstimatedBytes / int64(len(chunks)),
 			}
 			t.DataFiles[k] = p.entry()
 			if st, done := states[strings.ToLower(p.label())]; done {
@@ -385,9 +386,12 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 	}
 
 	// Largest first. The run cannot finish before its biggest piece does, so
-	// starting that one last would leave the other workers idle.
+	// starting that one last would leave the other workers idle. This orders by
+	// the table's real size rather than by its progress weight: a filtered table
+	// carries no weight but can still take a full scan to read, and scheduling
+	// it last would leave exactly the long tail this is meant to avoid.
 	sort.SliceStable(pieces, func(a, b int) bool {
-		return pieces[a].estBytes > pieces[b].estBytes
+		return pieces[a].schedBytes > pieces[b].schedBytes
 	})
 	if workers > len(pieces) {
 		workers = len(pieces)
@@ -683,7 +687,32 @@ type piece struct {
 	chunk      *sqlsrv.Chunk // nil for a table read in one piece
 	key        string        // chunk key column name
 	estRows    int64
+	// estBytes is this piece's share of the whole-export progress, and
+	// schedBytes its size for ordering. They differ only for a filtered table:
+	// see progressBytes.
 	estBytes   int64
+	schedBytes int64
+}
+
+// progressBytes is the share of the whole-export estimate a table represents.
+//
+// For a filtered table that is zero, not its size. --where can select one row
+// in a million, so the table's source size says nothing about how much of it
+// will be written, and counting it in full made the bar crawl through the rest
+// of the run and then leap when the filtered table finished. There is no cheap
+// way to learn the true figure - it would take a COUNT over the predicate,
+// which is most of the work of reading the table - so the honest move is to
+// leave filtered tables out of the estimate rather than to guess at them.
+//
+// Both sides of the fraction drop the same tables, so the percentage stays
+// truthful about the work it covers. What suffers is the ETA, which runs long
+// because time spent on filtered tables is not represented in the numerator.
+// A pessimistic ETA is a better failure than a bar that moves backwards.
+func progressBytes(t *model.Table) int64 {
+	if t.RowFilter != "" {
+		return 0
+	}
+	return t.EstimatedBytes
 }
 
 // label names a piece for the log and the spool.
