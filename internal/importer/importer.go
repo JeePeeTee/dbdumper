@@ -88,6 +88,12 @@ func Run(ctx context.Context, db *sql.DB, ar *archive.Reader, opts Options) (*Re
 	}
 	res.Tables = len(tables)
 
+	// The DDL is planned from a model in which the tables this run is not
+	// loading are marked as holding no rows, so the foreign keys pointing at
+	// them are created unvalidated rather than failing on a constraint the
+	// restore was never going to satisfy.
+	dbm = markUnloadedTables(dbm, keep, opts)
+
 	if !opts.DataOnly {
 		for _, ph := range plan.SchemaPhases(dbm) {
 			if err := runPhase(ctx, db, ph, opts, res); err != nil {
@@ -116,6 +122,63 @@ func Run(ctx context.Context, db *sql.DB, ar *archive.Reader, opts Options) (*Re
 
 	res.Duration = time.Since(start)
 	return res, nil
+}
+
+// markUnloadedTables returns the model the DDL should be planned from.
+//
+// --include and --exclude leave a table created but empty. Any foreign key
+// pointing at it then has nothing to resolve against, and adding it validated
+// fails outright:
+//
+//	The ALTER TABLE statement conflicted with the FOREIGN KEY constraint (547)
+//
+// which aborts the restore over a table the caller deliberately left out.
+// Marking those tables as holding no rows puts them under the same rule the
+// export already applies to --exclude-data, so the affected keys are created
+// WITH NOCHECK and the restore completes.
+//
+// --schema-only needs no such treatment: it loads nothing anywhere, so every
+// foreign key validates against an empty table and stays trusted.
+func markUnloadedTables(dbm *model.Database, keep sqlsrv.TableFilter, opts Options) *model.Database {
+	if keep == nil {
+		return dbm
+	}
+
+	out := *dbm
+	out.Tables = make([]model.Table, len(dbm.Tables))
+	copy(out.Tables, dbm.Tables)
+
+	skipped := 0
+	for i := range out.Tables {
+		t := &out.Tables[i]
+		if keep(t.Schema, t.Name) || t.DataSkipped {
+			continue
+		}
+		t.DataSkipped = true
+		skipped++
+	}
+	if skipped == 0 {
+		return dbm
+	}
+
+	untrusted := plan.UntrustedForeignKeys(&out)
+	if len(untrusted) == 0 {
+		return &out
+	}
+	// Loud: the restored database will have dangling references, and nothing
+	// about it afterwards says so except the constraints' is_not_trusted flag.
+	opts.warn("%d table(s) were left out by --include/--exclude, so %d foreign key(s) pointing",
+		skipped, len(untrusted))
+	opts.warn("at them are created WITH NOCHECK and left untrusted:")
+	for i, a := range untrusted {
+		if i >= 10 {
+			opts.warn("  ... and %d more", len(untrusted)-i)
+			break
+		}
+		opts.warn("  %s", a)
+	}
+	opts.warn("exclude the referencing tables too if you need referential integrity")
+	return &out
 }
 
 // runPhase executes a phase, retrying the statements marked Retryable until no

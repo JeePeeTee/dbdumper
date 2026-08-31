@@ -160,16 +160,53 @@ func checks(db *model.Database) []Stmt {
 	return out
 }
 
+// partialTables is the set of tables that will not hold all of their rows,
+// keyed by lower-cased qualified name.
+func partialTables(db *model.Database) map[string]bool {
+	out := map[string]bool{}
+	for _, t := range db.Tables {
+		if t.PartialData() {
+			out[strings.ToLower(t.Schema+"."+t.Name)] = true
+		}
+	}
+	return out
+}
+
+// UntrustedForeignKeys describes the foreign keys worth warning about: those
+// created unvalidated by foreignKeys whose own table *is* fully loaded, and
+// which will therefore hold rows referring to rows that are not there.
+//
+// It is deliberately narrower than the rule foreignKeys marks by. A key on a
+// table that is itself only partly held is also created unvalidated, but
+// reporting it adds nothing: the caller already knows that table is partial,
+// and saying so for every key it owns buries the cases that matter.
+func UntrustedForeignKeys(db *model.Database) []string {
+	partial := partialTables(db)
+	if len(partial) == 0 {
+		return nil
+	}
+	var out []string
+	for _, t := range db.Tables {
+		// A partially held table satisfies its own outgoing keys: every row it
+		// does hold still points at a row that exists.
+		if t.PartialData() {
+			continue
+		}
+		for _, fk := range t.ForeignKeys {
+			if partial[strings.ToLower(fk.ReferencedSchema+"."+fk.ReferencedTable)] {
+				out = append(out, fmt.Sprintf("%s on %s.%s -> %s.%s",
+					fk.Name, t.Schema, t.Name, fk.ReferencedSchema, fk.ReferencedTable))
+			}
+		}
+	}
+	return out
+}
+
 func foreignKeys(db *model.Database) []Stmt {
 	// A table holding only some of its rows - skipped outright, or filtered by
 	// --where - cannot satisfy the foreign keys pointing at it, so those have
 	// to be created unvalidated.
-	skipped := map[string]bool{}
-	for _, t := range db.Tables {
-		if t.PartialData() {
-			skipped[strings.ToLower(t.Schema+"."+t.Name)] = true
-		}
-	}
+	skipped := partialTables(db)
 
 	var out []Stmt
 	for _, t := range db.Tables {
