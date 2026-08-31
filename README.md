@@ -463,8 +463,9 @@ comparisons below its `model.xml` contained no user, role or permission elements
 403 tables, 403 primary keys, 1,091 indexes, 708 foreign keys and 13 views this tool records, and
 nothing about security. What it did carry that this does not is a database master key and two
 database-scoped credentials. If you need permissions reproduced, neither format is the answer:
-script them with `mssql-scripter` or SSMS's Generate Scripts, which read `sys.database_principals`
-and `sys.database_permissions` directly.
+script them with [dbatools](https://dbatools.io) — `Export-DbaLogin` and `Export-DbaUser` — or
+SSMS's Generate Scripts, both of which read `sys.database_principals` and
+`sys.database_permissions` directly.
 
 ## Archive format
 
@@ -576,9 +577,14 @@ copy.
 
 **Users, roles and permissions.** Not captured — see
 [what gets captured](#what-gets-captured) for the full list of what is left out. Script them with
-`mssql-scripter` or SSMS's Generate Scripts, which read the security catalogue directly. A
-`.bacpac` is not the alternative here: it carries contained users at best and no server logins at
-all.
+[dbatools](https://dbatools.io) (`Export-DbaLogin`, `Export-DbaUser`) or SSMS's Generate Scripts,
+which read the security catalogue directly. A `.bacpac` is not the alternative here: it carries
+contained users at best and no server logins at all.
+
+Microsoft's `mssql-scripter` used to be the obvious cross-platform answer, and earlier versions of
+this README recommended it. It is
+[no longer maintained](https://github.com/microsoft/mssql-scripter) — the repository says so, and
+its last release is still an alpha. Prefer dbatools.
 
 **Loading one large table as fast as physically possible.** `bcp` with a native-format file will
 beat this; it does one thing.
