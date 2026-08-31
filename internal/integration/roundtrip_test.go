@@ -112,7 +112,11 @@ func runRoundTrip(t *testing.T, noBulk bool) {
 	dir := t.TempDir()
 	archiveA := filepath.Join(dir, "a.dbdump")
 
-	resA, err := export.Run(ctx, src, export.Options{Out: archiveA, Warn: warnf(t)})
+	// Parallel on purpose: this is the only place the concurrent export path is
+	// exercised end to end, and the comparison below then also proves that
+	// reading tables concurrently produces the same archive as reading them one
+	// at a time. Run under -race to get the most out of it.
+	resA, err := export.Run(ctx, src, export.Options{Out: archiveA, Parallel: 4, Warn: warnf(t)})
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
@@ -158,7 +162,7 @@ func runRoundTrip(t *testing.T, noBulk bool) {
 	// round trip changed - a type, a default, a value, an index option - shows
 	// up as a difference here.
 	archiveB := filepath.Join(dir, "b.dbdump")
-	if _, err := export.Run(ctx, dst, export.Options{Out: archiveB, Warn: warnf(t)}); err != nil {
+	if _, err := export.Run(ctx, dst, export.Options{Out: archiveB, Parallel: 4, Warn: warnf(t)}); err != nil {
 		t.Fatalf("re-export: %v", err)
 	}
 	arB, err := archive.Open(archiveB)
