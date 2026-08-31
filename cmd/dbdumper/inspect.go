@@ -54,6 +54,7 @@ func runInspect(args []string) error {
 	if m.Source.SchemaOnly {
 		fmt.Printf("contents       schema only (no rows)\n")
 	}
+	reportPartialData(os.Stdout, &m.Database)
 
 	d := &m.Database
 	var mods = map[model.ModuleKind]int{}
@@ -86,17 +87,91 @@ func runInspect(args []string) error {
 	if len(d.Tables) > 0 {
 		tables := append([]model.Table(nil), d.Tables...)
 		sort.Slice(tables, func(i, j int) bool { return tables[i].RowCount > tables[j].RowCount })
+		partial := anyPartialData(d)
 		fmt.Printf("\nlargest tables\n")
 		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "  TABLE\tROWS\tCOLS")
+		header := "  TABLE\tROWS\tCOLS"
+		if partial {
+			header += "\tDATA"
+		}
+		fmt.Fprintln(tw, header)
 		for i, t := range tables {
 			if i >= 20 {
 				fmt.Fprintf(tw, "  ... and %d more\t\t\n", len(tables)-i)
 				break
 			}
-			fmt.Fprintf(tw, "  %s.%s\t%d\t%d\n", t.Schema, t.Name, t.RowCount, len(t.Columns))
+			fmt.Fprintf(tw, "  %s.%s\t%d\t%d", t.Schema, t.Name, t.RowCount, len(t.Columns))
+			if partial {
+				fmt.Fprintf(tw, "\t%s", partialNote(t))
+			}
+			fmt.Fprintln(tw)
 		}
 		tw.Flush()
 	}
 	return nil
+}
+
+// anyPartialData reports whether any table holds less than all of its rows.
+func anyPartialData(d *model.Database) bool {
+	for _, t := range d.Tables {
+		if t.PartialData() {
+			return true
+		}
+	}
+	return false
+}
+
+// partialNote describes what an archive holds for one table, and is empty for
+// the ordinary case of a table dumped whole.
+func partialNote(t model.Table) string {
+	switch {
+	case t.DataSkipped:
+		return "excluded"
+	case t.RowFilter != "":
+		return "filtered"
+	default:
+		return "complete"
+	}
+}
+
+// reportPartialData names the tables an archive does not hold in full.
+//
+// A restore of such an archive is not a copy of the source, and the row counts
+// printed above give no sign of it - an excluded table shows zero rows, which
+// is indistinguishable from a table that was genuinely empty. It is worth
+// several lines to say so plainly.
+func reportPartialData(w io.Writer, d *model.Database) {
+	var excluded, filtered []model.Table
+	for _, t := range d.Tables {
+		switch {
+		case t.DataSkipped:
+			excluded = append(excluded, t)
+		case t.RowFilter != "":
+			filtered = append(filtered, t)
+		}
+	}
+	if len(excluded)+len(filtered) == 0 {
+		return
+	}
+
+	fmt.Fprintf(w, "\npartial data   %d table(s) are not held in full\n", len(excluded)+len(filtered))
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	shown := 0
+	for _, t := range excluded {
+		if shown++; shown > 20 {
+			break
+		}
+		fmt.Fprintf(tw, "  %s.%s\trows excluded (--exclude-data)\n", t.Schema, t.Name)
+	}
+	for _, t := range filtered {
+		if shown++; shown > 20 {
+			break
+		}
+		fmt.Fprintf(tw, "  %s.%s\trows filtered: %s\n", t.Schema, t.Name, truncate(t.RowFilter, 60))
+	}
+	if n := len(excluded) + len(filtered) - 20; n > 0 {
+		fmt.Fprintf(tw, "  ... and %d more\t\n", n)
+	}
+	tw.Flush()
+	fmt.Fprintf(w, "  restoring this archive will not reproduce the source database\n")
 }
