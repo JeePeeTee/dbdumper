@@ -208,7 +208,7 @@ func loadAllData(ctx context.Context, db *sql.DB, ar *archive.Reader, tables []m
 	// starts early and short tables fill in behind it.
 	todo := make([]model.Table, 0, len(tables))
 	for _, t := range tables {
-		if t.DataFile != "" && ar.HasEntry(t.DataFile) {
+		if len(t.DataEntries()) > 0 {
 			todo = append(todo, t)
 		}
 	}

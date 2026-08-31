@@ -129,7 +129,8 @@ func (s *Spool) Completed() (map[string]TableState, error) {
 
 	out := map[string]TableState{}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), stateSuffix) {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), stateSuffix) ||
+			strings.HasSuffix(e.Name(), ".plan"+stateSuffix) {
 			continue
 		}
 		var st TableState
@@ -146,6 +147,30 @@ func (s *Spool) Completed() (map[string]TableState, error) {
 		out[st.Identity] = st
 	}
 	return out, nil
+}
+
+// SavePlan records how a table was divided, so that a resume reads the
+// remaining chunks with the boundaries the first run used. Boundaries come from
+// a sample of live data, so recomputing them would shift the ranges and leave
+// gaps between chunks written before the interruption and chunks written after.
+func (s *Spool) SavePlan(tableIndex int, v any) error {
+	return writeJSONAtomic(s.planPath(tableIndex), v)
+}
+
+// LoadPlan reads back a plan saved earlier, reporting whether there was one.
+func (s *Spool) LoadPlan(tableIndex int, v any) (bool, error) {
+	err := readJSON(s.planPath(tableIndex), v)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Spool) planPath(tableIndex int) string {
+	return filepath.Join(s.dir, tablesDir, fmt.Sprintf("%05d.plan%s", tableIndex, stateSuffix))
 }
 
 // TableWriter accumulates one table's rows.

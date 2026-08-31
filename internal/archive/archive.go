@@ -53,6 +53,14 @@ func escapeSegment(s string) string {
 	return b.String()
 }
 
+// ChunkDataPath returns the entry name for one range of a table read in
+// several pieces. The index is zero-padded so the entries sort in key order in
+// any listing.
+func ChunkDataPath(schema, table string, chunk int) string {
+	return path.Join("data", fmt.Sprintf("%s.%s.part%03d.jsonl",
+		escapeSegment(schema), escapeSegment(table), chunk))
+}
+
 // Writer builds an archive. Entries are written sequentially.
 type Writer struct {
 	f  *os.File

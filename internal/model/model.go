@@ -101,7 +101,11 @@ type Table struct {
 	// Computed and rowversion columns are excluded: they cannot be inserted.
 	DataColumns []string `json:"dataColumns,omitempty"`
 	DataFile    string   `json:"dataFile,omitempty"`
-	RowCount    int64    `json:"rowCount"`
+	// DataFiles holds the entries of a table read in several chunks, in key
+	// order. DataFile stays in use for the ordinary single-piece case, so
+	// archives written before chunking existed still read.
+	DataFiles []string `json:"dataFiles,omitempty"`
+	RowCount  int64    `json:"rowCount"`
 	// EstimatedRows is the engine's own row count, read before the dump starts
 	// so progress has something to count towards. It can be slightly stale, so
 	// it drives display only, never control flow.
@@ -118,6 +122,18 @@ type Table struct {
 	// RowFilter is the --where predicate the rows were selected with, if any.
 	// Its presence means the archive holds a subset of the table.
 	RowFilter string `json:"rowFilter,omitempty"`
+}
+
+// DataEntries lists every archive entry holding this table's rows, in the order
+// they should be loaded.
+func (t Table) DataEntries() []string {
+	if len(t.DataFiles) > 0 {
+		return t.DataFiles
+	}
+	if t.DataFile != "" {
+		return []string{t.DataFile}
+	}
+	return nil
 }
 
 // PartialData reports whether the archive holds fewer rows than the source

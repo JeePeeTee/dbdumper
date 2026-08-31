@@ -34,8 +34,12 @@ type Options struct {
 	// skipped. Unlike Exclude, the table, its indexes and its constraints are
 	// still created on restore - it just comes back empty.
 	ExcludeData []string
-	// Parallel is how many tables are read concurrently.
+	// Parallel is how many pieces of work are read concurrently.
 	Parallel int
+	// ChunkMinBytes is the source size above which a table is split into
+	// ranges that can be read at the same time. Zero uses the default; a
+	// negative value turns splitting off.
+	ChunkMinBytes int64
 	// Resume continues an interrupted export from its work directory instead
 	// of starting over. Restart discards that directory. With neither, an
 	// existing work directory is an error rather than a silent choice.
@@ -305,20 +309,27 @@ func openSpool(dbm *model.Database, src model.Source, opts Options) (*spool.Spoo
 }
 
 // spoolTables writes every table not already present in the work directory.
+// DefaultChunkMinBytes is the source size above which a table is worth reading
+// in several ranges at once. Below it the planning query and the extra
+// connections cost more than the concurrency wins.
+const DefaultChunkMinBytes = 128 << 20 // 128 MB
+
 func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[string]spool.TableState,
 	dbm *model.Database, res *Result, opts Options) error {
 
 	skipData := sqlsrv.NewTableFilter(opts.ExcludeData, nil)
+	in := &sqlsrv.Introspector{DB: db, Warn: opts.warn}
+
+	workers := opts.Parallel
+	if workers < 1 {
+		workers = 1
+	}
 
 	// Decide what this run has to do, and how big it is. Skipped tables cost
 	// nothing and resumed ones already did, so neither belongs in the total.
-	type job struct {
-		index int // position in dbm.Tables, which names the spool file
-		pos   int // 1-based position for display
-		t     *model.Table
-	}
-	var jobs []job
+	var pieces []piece
 	var totalBytes int64
+	nextSpoolIndex := 0
 
 	for i := range dbm.Tables {
 		t := &dbm.Tables[i]
@@ -327,34 +338,59 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 			opts.log("  %-50s %10s", t.Schema+"."+t.Name, "(data skipped)")
 			continue
 		}
-		if st, done := states[strings.ToLower(t.Schema+"."+t.Name)]; done {
-			t.RowCount, t.DataFile = st.Rows, st.Entry
-			res.Rows += st.Rows
-			res.DataBytes += int64(st.UncompressedSize)
-			res.ResumedTables++
-			opts.log("  %-50s %10d rows  %10s (resumed)",
-				t.Schema+"."+t.Name, st.Rows, humanBytes(int64(st.UncompressedSize)))
+
+		chunks, key := planFor(ctx, in, sp, t, i, workers, opts)
+		base := nextSpoolIndex
+		// Reserve a spool slot per piece up front, so the numbering is stable
+		// across a resume even if a table is skipped on the second run.
+		nextSpoolIndex += max(1, len(chunks))
+
+		if len(chunks) == 0 {
+			p := piece{tableIndex: i, spoolIndex: base, pos: i + 1, t: t,
+				estRows: t.EstimatedRows, estBytes: t.EstimatedBytes}
+			if st, done := states[strings.ToLower(p.label())]; done {
+				adoptResumed(t, st, res, opts)
+				continue
+			}
+			pieces = append(pieces, p)
+			totalBytes += t.EstimatedBytes
 			continue
 		}
-		jobs = append(jobs, job{index: i, pos: i + 1, t: t})
-		totalBytes += t.EstimatedBytes
+
+		// A split table's rows arrive as several entries, in key order.
+		t.DataFiles = make([]string, len(chunks))
+		for k := range chunks {
+			p := piece{
+				tableIndex: i, spoolIndex: base + k, pos: i + 1, t: t,
+				chunk: &chunks[k], key: key.Column.Name,
+				estRows:  t.EstimatedRows / int64(len(chunks)),
+				estBytes: t.EstimatedBytes / int64(len(chunks)),
+			}
+			t.DataFiles[k] = p.entry()
+			if st, done := states[strings.ToLower(p.label())]; done {
+				t.RowCount += st.Rows
+				res.Rows += st.Rows
+				res.DataBytes += int64(st.UncompressedSize)
+				continue
+			}
+			pieces = append(pieces, p)
+			totalBytes += p.estBytes
+		}
+		if t.RowCount > 0 && len(pieces) == 0 {
+			res.ResumedTables++
+		}
 	}
-	if len(jobs) == 0 {
+	if len(pieces) == 0 {
 		return nil
 	}
 
-	// Largest first. The run cannot finish before its biggest table does, so
-	// starting that one last would leave the other workers idle at the end.
-	sort.SliceStable(jobs, func(a, b int) bool {
-		return jobs[a].t.EstimatedBytes > jobs[b].t.EstimatedBytes
+	// Largest first. The run cannot finish before its biggest piece does, so
+	// starting that one last would leave the other workers idle.
+	sort.SliceStable(pieces, func(a, b int) bool {
+		return pieces[a].estBytes > pieces[b].estBytes
 	})
-
-	workers := opts.Parallel
-	if workers < 1 {
-		workers = 1
-	}
-	if workers > len(jobs) {
-		workers = len(jobs)
+	if workers > len(pieces) {
+		workers = len(pieces)
 	}
 
 	tr := newTracker(totalBytes)
@@ -367,7 +403,7 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 	defer close(stop)
 
 	var (
-		mu       sync.Mutex // guards states, res and firstErr
+		mu       sync.Mutex // guards states, res, the model and firstErr
 		firstErr error
 		next     int64 = -1
 	)
@@ -381,26 +417,30 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 			defer wg.Done()
 			for {
 				i := int(atomic.AddInt64(&next, 1))
-				if i >= len(jobs) {
+				if i >= len(pieces) {
 					return
 				}
-				j := jobs[i]
+				p := pieces[i]
 
-				st, err := dumpTable(runCtx, db, sp, j.index, j.t, opts, j.pos, len(dbm.Tables), tr)
+				st, err := dumpTable(runCtx, db, sp, p, opts, len(dbm.Tables), tr)
 
 				mu.Lock()
 				if err != nil {
 					if firstErr == nil {
-						firstErr = fmt.Errorf("dump %s.%s: %w", j.t.Schema, j.t.Name, err)
+						firstErr = fmt.Errorf("dump %s: %w", p.label(), err)
 						cancel()
 					}
 					mu.Unlock()
 					continue
 				}
 				if st.Entry != "" {
-					states[strings.ToLower(j.t.Schema+"."+j.t.Name)] = st
-					// Only this goroutine touches this table's element.
-					j.t.RowCount, j.t.DataFile = st.Rows, st.Entry
+					states[strings.ToLower(p.label())] = st
+					// Chunks of one table share its element, so this is under
+					// the same lock as everything else that touches the model.
+					if p.chunk == nil {
+						p.t.DataFile = st.Entry
+					}
+					p.t.RowCount += st.Rows
 					res.Rows += st.Rows
 					res.DataBytes += int64(st.UncompressedSize)
 				}
@@ -410,6 +450,79 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 	}
 	wg.Wait()
 	return firstErr
+}
+
+// adoptResumed takes a table already present in the work directory.
+func adoptResumed(t *model.Table, st spool.TableState, res *Result, opts Options) {
+	t.RowCount, t.DataFile = st.Rows, st.Entry
+	res.Rows += st.Rows
+	res.DataBytes += int64(st.UncompressedSize)
+	res.ResumedTables++
+	opts.log("  %-50s %10d rows  %10s (resumed)",
+		t.Schema+"."+t.Name, st.Rows, humanBytes(int64(st.UncompressedSize)))
+}
+
+// planFor decides how a table is read, reusing an earlier run's division when
+// one is on record.
+//
+// The boundaries come from a sample of live data, so recomputing them on a
+// resume would shift the ranges: rows between the old boundary and the new one
+// would fall into no chunk at all, or into two. The plan is therefore saved
+// with the work directory and read back rather than recomputed.
+func planFor(ctx context.Context, in *sqlsrv.Introspector, sp *spool.Spool,
+	t *model.Table, tableIndex, workers int, opts Options) ([]sqlsrv.Chunk, sqlsrv.ChunkKey) {
+
+	var saved savedPlan
+	if ok, err := sp.LoadPlan(tableIndex, &saved); err != nil {
+		opts.warn("could not read the chunk plan for %s.%s (%v); reading it in one piece",
+			t.Schema, t.Name, err)
+		return nil, sqlsrv.ChunkKey{}
+	} else if ok {
+		key, found := in.ChunkKeyFor(ctx, *t)
+		if !found || !strings.EqualFold(key.Column.Name, saved.Key) {
+			return nil, sqlsrv.ChunkKey{}
+		}
+		chunks, err := saved.chunks(key)
+		if err != nil {
+			opts.warn("could not restore the chunk plan for %s.%s (%v); reading it in one piece",
+				t.Schema, t.Name, err)
+			return nil, sqlsrv.ChunkKey{}
+		}
+		return chunks, key
+	}
+
+	minBytes := opts.ChunkMinBytes
+	if minBytes == 0 {
+		minBytes = DefaultChunkMinBytes
+	}
+	if minBytes < 0 || workers < 2 || t.EstimatedBytes < minBytes {
+		return nil, sqlsrv.ChunkKey{}
+	}
+	key, found := in.ChunkKeyFor(ctx, *t)
+	if !found {
+		return nil, sqlsrv.ChunkKey{}
+	}
+
+	// Enough pieces to keep every worker busy on this table alone, since a
+	// table big enough to split is usually the one everything waits for.
+	n := workers * 2
+	chunks, err := in.PlanChunks(ctx, *t, key, n)
+	if err != nil || len(chunks) == 0 {
+		return nil, sqlsrv.ChunkKey{}
+	}
+	if err := sp.SavePlan(tableIndex, newSavedPlan(key, chunks)); err != nil {
+		opts.warn("could not record the chunk plan for %s.%s (%v); a resume will read it in one piece",
+			t.Schema, t.Name, err)
+	}
+	opts.log("  %-50s split into %d ranges on [%s]", t.Schema+"."+t.Name, len(chunks), key.Column.Name)
+	return chunks, key
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // packageArchive assembles the finished archive from the work directory.
@@ -429,14 +542,19 @@ func packageArchive(sp *spool.Spool, states map[string]spool.TableState,
 
 	for i := range dbm.Tables {
 		t := &dbm.Tables[i]
-		st, ok := states[strings.ToLower(t.Schema+"."+t.Name)]
-		if !ok {
-			continue
+		// Iterate on what this run decided to include, not on what the work
+		// directory happens to hold: a table excluded or emptied by this run
+		// may still have data spooled by an earlier one.
+		for _, entry := range t.DataEntries() {
+			st, ok := states[strings.ToLower(entryLabel(t, entry))]
+			if !ok {
+				return fmt.Errorf("package %s.%s: no spooled data for %s", t.Schema, t.Name, entry)
+			}
+			if err := copySpooled(w, sp, st); err != nil {
+				return fmt.Errorf("package %s: %w", st.Identity, err)
+			}
+			sp.DropData(st)
 		}
-		if err := copySpooled(w, sp, st); err != nil {
-			return fmt.Errorf("package %s.%s: %w", t.Schema, t.Name, err)
-		}
-		sp.DropData(st)
 	}
 
 	for _, ph := range plan.AllPhases(dbm) {
@@ -459,6 +577,16 @@ func packageArchive(sp *spool.Spool, states map[string]spool.TableState,
 		return err
 	}
 	return w.Close()
+}
+
+// entryLabel recovers the spool identity that produced an archive entry.
+func entryLabel(t *model.Table, entry string) string {
+	for k, e := range t.DataFiles {
+		if e == entry {
+			return fmt.Sprintf("%s.%s#%d", t.Schema, t.Name, k)
+		}
+	}
+	return t.Schema + "." + t.Name
 }
 
 func copySpooled(w *archive.Writer, sp *spool.Spool, st spool.TableState) error {
@@ -546,8 +674,37 @@ func warnUntrustedKeys(dbm *model.Database, opts Options) {
 
 // dumpTable writes one table's rows and reports how many, and how many
 // uncompressed bytes they took.
-func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *model.Table,
-	opts Options, pos, total int, tr *tracker) (spool.TableState, error) {
+// piece is one unit of reading: a whole table, or one range of a split table.
+type piece struct {
+	tableIndex int // position in dbm.Tables, and the spool file family
+	spoolIndex int // unique per piece, so chunks do not share a spool file
+	pos        int // 1-based table position, for display
+	t          *model.Table
+	chunk      *sqlsrv.Chunk // nil for a table read in one piece
+	key        string        // chunk key column name
+	estRows    int64
+	estBytes   int64
+}
+
+// label names a piece for the log and the spool.
+func (p piece) label() string {
+	if p.chunk == nil {
+		return p.t.Schema + "." + p.t.Name
+	}
+	return fmt.Sprintf("%s.%s#%d", p.t.Schema, p.t.Name, p.chunk.Index)
+}
+
+func (p piece) entry() string {
+	if p.chunk == nil {
+		return archive.DataPath(p.t.Schema, p.t.Name)
+	}
+	return archive.ChunkDataPath(p.t.Schema, p.t.Name, p.chunk.Index)
+}
+
+func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, pc piece,
+	opts Options, total int, tr *tracker) (spool.TableState, error) {
+
+	index, t, pos := pc.spoolIndex, pc.t, pc.pos
 
 	var none spool.TableState
 	cols := dataColumns(*t)
@@ -557,8 +714,8 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *m
 	}
 	codec := sqlsrv.NewRowCodec(cols)
 
-	entry := archive.DataPath(t.Schema, t.Name)
-	tw, err := sp.NewTable(index, strings.ToLower(t.Schema+"."+t.Name), entry)
+	entry := pc.entry()
+	tw, err := sp.NewTable(index, strings.ToLower(pc.label()), entry)
 	if err != nil {
 		return none, err
 	}
@@ -587,14 +744,24 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *m
 	// The predicate is raw T-SQL from the caller's own command line, spliced in
 	// as written. There is nothing to escape: it is an expression, not a value,
 	// and the caller already controls the connection string.
-	estimated := t.EstimatedRows
+	estimated := pc.estRows
+	var where []string
+	var args []any
 	if t.RowFilter != "" {
-		query += " WHERE " + t.RowFilter
+		where = append(where, "("+t.RowFilter+")")
 		// The engine's row count is for the whole table, so it would make the
 		// bar and the ETA lie. Better no percentage than a wrong one.
 		estimated = 0
 	}
-	rows, err := db.QueryContext(ctx, query)
+	if pc.chunk != nil {
+		var pred string
+		pred, args = pc.chunk.Predicate(pc.key, args)
+		where = append(where, pred)
+	}
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return none, fmt.Errorf("%s: %w", query, err)
 	}
@@ -603,8 +770,8 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *m
 	// Counters the reporter goroutine reads; it decides when to draw, so this
 	// loop only has to keep them current.
 	run := &tableRun{
-		table: t.Schema + "." + t.Name, index: pos,
-		estRows: estimated, estBytes: t.EstimatedBytes,
+		table: pc.label(), index: pos,
+		estRows: estimated, estBytes: pc.estBytes,
 	}
 	tr.begin(run)
 	defer tr.finish(run)
@@ -645,7 +812,7 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *m
 	if t.RowFilter != "" {
 		suffix = " (filtered)"
 	}
-	opts.log("  %-50s %10d rows  %10s%s", t.Schema+"."+t.Name, n, humanBytes(cw.n), suffix)
+	opts.log("  %-50s %10d rows  %10s%s", pc.label(), n, humanBytes(cw.n), suffix)
 	return st, nil
 }
 
