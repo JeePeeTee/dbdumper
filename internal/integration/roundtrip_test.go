@@ -60,6 +60,15 @@ func TestBulkSafeClassification(t *testing.T) {
 			{TypeSchema: "dbo", TypeName: "PhoneNumber", BaseTypeName: "nvarchar"}}, true},
 		{"alias over xml", []model.Column{
 			{TypeSchema: "dbo", TypeName: "Doc", BaseTypeName: "xml"}}, false},
+		// vector resolves to varbinary, which is on the accepted list, so the
+		// catch-all for unknown types cannot see it. Bulk copy would send it as
+		// bytes and the server would refuse: "Operand type clash: varbinary is
+		// incompatible with vector" (206).
+		{"vector", []model.Column{
+			{TypeName: "vector", BaseTypeName: "varbinary", MaxLength: 6152}}, false},
+		{"vector beside safe columns", []model.Column{
+			{TypeName: "int"},
+			{TypeName: "vector", BaseTypeName: "varbinary", MaxLength: 20}}, false},
 	}
 	for _, c := range cases {
 		if got := sqlsrv.BulkSafe(c.cols); got != c.want {

@@ -22,6 +22,16 @@ func (c Column) TypeRef() string {
 		return Quote(c.TypeSchema) + "." + Quote(c.TypeName)
 	}
 	base := Quote(c.TypeName)
+	if c.IsVector() {
+		// vector carries its dimension count the way varchar carries a length,
+		// and the server rejects it without one: "Cannot find data type vector"
+		// (2715), which reads like the type is unsupported rather than
+		// incompletely written.
+		if n := c.VectorDimensions(); n > 0 {
+			return fmt.Sprintf("%s(%d)", base, n)
+		}
+		return base
+	}
 	switch strings.ToLower(c.TypeName) {
 	case "char", "varchar", "binary", "varbinary":
 		if c.MaxLength == -1 {

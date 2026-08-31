@@ -22,6 +22,12 @@ func BulkSafe(cols []model.Column) bool {
 		case kindVariant:
 			return false
 		}
+		// The fallback below is meant to catch types a newer server has added,
+		// but it cannot see vector: SystemType resolves that to varbinary,
+		// which is on the accepted list.
+		if c.IsVector() {
+			return false
+		}
 		switch c.SystemType() {
 		case "xml", "geography", "geometry", "hierarchyid":
 			return false

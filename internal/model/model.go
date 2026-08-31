@@ -190,11 +190,46 @@ func (c Column) Insertable() bool {
 }
 
 // SystemType returns the underlying system type name, resolving alias types.
+//
+// Beware of it for anything that must distinguish vector from the type it is
+// built on: sys.types reports vector's system_type_id as varbinary, so this
+// answers "varbinary" for a vector column. Use IsVector where the difference
+// matters - the DDL it needs, the way its values travel, and whether bulk copy
+// can carry it are all unlike varbinary's.
 func (c Column) SystemType() string {
 	if c.BaseTypeName != "" {
 		return strings.ToLower(c.BaseTypeName)
 	}
 	return strings.ToLower(c.TypeName)
+}
+
+// IsVector reports whether this is SQL Server 2025's vector column type.
+//
+// The check is on the type's own name rather than on the system type it
+// resolves to, and excludes user-defined types, which live in a schema and
+// could legitimately be named "vector".
+func (c Column) IsVector() bool {
+	return c.TypeSchema == "" && strings.EqualFold(c.TypeName, "vector")
+}
+
+// VectorDimensions returns how many dimensions a vector column holds.
+//
+// SQL Server does not expose this as a catalogue column on every build, but it
+// is recoverable from the storage size: a vector is an 8-byte header followed
+// by one 4-byte float per dimension, so vector(3) reports max_length 20 and
+// vector(1536) reports 6152. Both were confirmed against a live server.
+//
+// It returns 0 when the size makes no sense, which the caller should treat as
+// "unknown" rather than as zero dimensions.
+func (c Column) VectorDimensions() int {
+	const (
+		header    = 8 // fixed prefix, whatever the dimension count
+		perColumn = 4 // float32 per dimension; the only element type today
+	)
+	if c.MaxLength <= header || (c.MaxLength-header)%perColumn != 0 {
+		return 0
+	}
+	return (c.MaxLength - header) / perColumn
 }
 
 // IndexColumn is one key or included column of an index.

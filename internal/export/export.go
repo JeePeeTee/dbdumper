@@ -884,6 +884,8 @@ Value encoding
   binary, varbinary,
     image, geography,
     geometry, hierarchyid  base64 string
+  vector                 the server's own JSON text, e.g.
+                         "[1.5000000e+000,-2.0000000e+000]"
   date                   "2006-01-02"
   time                   "15:04:05.1234567"
   datetime,
