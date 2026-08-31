@@ -95,6 +95,37 @@ func TestConnectHintForTheErrorsAzureDoesDistinguish(t *testing.T) {
 	}
 }
 
+// TestConnectHintForADisabledAccount - 18470 is not one of the ambiguous ones.
+// The server has already accepted the name and the password, so the advice for
+// 18456, which sends the reader off to check all three of those, would be
+// actively misleading here.
+func TestConnectHintForADisabledAccount(t *testing.T) {
+	disabled := mssql.Error{Number: errLoginDisabled,
+		Message: "Login failed for user 'appuser'. Reason: The account is disabled."}
+
+	got := ConnectHint(azureCfg(), disabled)
+	if !strings.Contains(got, "ALTER LOGIN [appuser@myserver] ENABLE;") {
+		t.Errorf("the hint should say how to re-enable the login:\n%s", got)
+	}
+	for _, unwanted := range []string{"password is wrong", "does not exist", "has no user in"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("a disabled account is unambiguous; the hint should not raise %q:\n%s", unwanted, got)
+		}
+	}
+
+	// The same is true off Azure: an account is disabled or it is not.
+	local := ConnConfig{Server: `DEVBOX\SQLEXPRESS`, Database: "AppDb", User: "sa"}
+	if got := ConnectHint(local, disabled); !strings.Contains(got, "ALTER LOGIN [sa] ENABLE;") {
+		t.Errorf("18470 should explain itself on a local server too, got:\n%s", got)
+	}
+
+	// With a trusted connection there is no login name to put in the statement.
+	trusted := ConnConfig{Server: "localhost", Trusted: true}
+	if got := ConnectHint(trusted, disabled); !strings.Contains(got, "ALTER LOGIN ... ENABLE") {
+		t.Errorf("expected the generic form when no login is known, got:\n%s", got)
+	}
+}
+
 func TestConnectHintFindsTheLoginInADSN(t *testing.T) {
 	cases := []ConnConfig{
 		{DSN: "sqlserver://appuser%40myserver:pw@myserver.database.windows.net?database=appdb"},

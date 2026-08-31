@@ -11,12 +11,12 @@ import (
 // SQL Server error numbers that Azure SQL returns for connection problems it
 // deliberately does not distinguish, plus the two it does.
 const (
-	errLoginFailed       = 18456 // wrong password, unknown database, or no user in it
-	errCannotOpenDB      = 4060  // the database exists but the login cannot enter it
-	errCannotOpenServer  = 40532 // login name not in the form the gateway could route
-	errIPNotAllowed      = 40615 // client address is not in the server firewall rules
-	errDatabaseUnavail   = 40613 // database is paused, scaling, or otherwise not available
-	errLoginFailedForDBP = 18470 // account disabled
+	errLoginFailed      = 18456 // wrong password, unknown database, or no user in it
+	errCannotOpenDB     = 4060  // the database exists but the login cannot enter it
+	errCannotOpenServer = 40532 // login name not in the form the gateway could route
+	errIPNotAllowed     = 40615 // client address is not in the server firewall rules
+	errDatabaseUnavail  = 40613 // database is paused, scaling, or otherwise not available
+	errLoginDisabled    = 18470 // the login exists and the password matched, but it is disabled
 )
 
 // ConnectHint turns a connection failure into advice, where the error alone is
@@ -45,7 +45,18 @@ func ConnectHint(c ConnConfig, err error) string {
 	case errCannotOpenServer:
 		return "Azure could not route the login to a server. Check the server name, and that the\n" +
 			"login is given as \"user@servername\" if your server requires that form."
-	case errLoginFailed, errCannotOpenDB, errLoginFailedForDBP:
+	case errLoginDisabled:
+		// Unlike 18456, this one is not ambiguous: the server has already
+		// accepted the name and the password and is refusing on policy. Sending
+		// the reader off to check for typos and missing users would be wrong.
+		login := c.LoginName()
+		if login == "" {
+			return "The login is disabled. An administrator can re-enable it with ALTER LOGIN ... ENABLE."
+		}
+		return fmt.Sprintf("The login %q exists and the password was accepted, but the account is disabled.\n"+
+			"Connected as an administrator:\n\n"+
+			"    ALTER LOGIN [%s] ENABLE;", login, login)
+	case errLoginFailed, errCannotOpenDB:
 		// Handled below, where the advice depends on the target.
 	default:
 		return ""
