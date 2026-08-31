@@ -21,6 +21,7 @@ func runExport(ctx context.Context, args []string) error {
 	force := fs.Bool("force", false, "overwrite --out if it already exists")
 	resume := fs.Bool("resume", false, "continue an export interrupted earlier")
 	restart := fs.Bool("restart", false, "discard an interrupted export and start over")
+	parallel := fs.Int("parallel", 4, "tables to read concurrently")
 	var include, exclude, excludeData, where stringList
 	fs.Var(&include, "include", "only these tables; glob on schema.table, repeatable")
 	fs.Var(&exclude, "exclude", "omit these tables entirely, definition included; repeatable")
@@ -50,6 +51,9 @@ func runExport(ctx context.Context, args []string) error {
 		}
 	}
 
+	// Each worker holds a connection for the length of a table, so the pool has
+	// to be at least as large as the worker count or they queue behind it.
+	conn.MaxConns = *parallel + 2
 	logf("connecting to %s", conn.Redacted())
 	db, err := sqlsrv.Open(ctx, *conn)
 	if err != nil {
@@ -70,6 +74,7 @@ func runExport(ctx context.Context, args []string) error {
 		Exclude:          exclude,
 		ExcludeData:      excludeData,
 		Where:            where,
+		Parallel:         *parallel,
 		Resume:           *resume,
 		Restart:          *restart,
 		Log:              logf,

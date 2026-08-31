@@ -8,7 +8,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/JeePeeTee/dbdumper/internal/archive"
@@ -31,6 +34,8 @@ type Options struct {
 	// skipped. Unlike Exclude, the table, its indexes and its constraints are
 	// still created on restore - it just comes back empty.
 	ExcludeData []string
+	// Parallel is how many tables are read concurrently.
+	Parallel int
 	// Resume continues an interrupted export from its work directory instead
 	// of starting over. Restart discards that directory. With neither, an
 	// existing work directory is an error rather than a silent choice.
@@ -72,6 +77,9 @@ type Progress struct {
 	TableBytes int64
 	Bytes      int64
 	Elapsed    time.Duration
+	// InFlight is how many tables are being read at this moment. Above one,
+	// Table names the one running longest - what the run is waiting on.
+	InFlight int
 
 	// The export as a whole. Work is counted in the source bytes reported by
 	// the engine, not in rows and not in the bytes written: rows per second
@@ -296,33 +304,21 @@ func openSpool(dbm *model.Database, src model.Source, opts Options) (*spool.Spoo
 	return sp, map[string]spool.TableState{}, nil
 }
 
-// overall tracks the whole run so a per-table progress report can say how much
-// of the export is left.
-type overall struct {
-	total   int64     // source bytes this run will read
-	done    int64     // source bytes finished
-	started time.Time // when the first table began
-}
-
 // spoolTables writes every table not already present in the work directory.
 func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[string]spool.TableState,
 	dbm *model.Database, res *Result, opts Options) error {
 
 	skipData := sqlsrv.NewTableFilter(opts.ExcludeData, nil)
 
-	// Size the run before starting it, counting only tables this run will
-	// actually read: skipped ones cost nothing, and resumed ones already did.
-	all := &overall{started: time.Now()}
-	for i := range dbm.Tables {
-		t := &dbm.Tables[i]
-		if skipData != nil && skipData(t.Schema, t.Name) {
-			continue
-		}
-		if _, done := states[strings.ToLower(t.Schema+"."+t.Name)]; done {
-			continue
-		}
-		all.total += t.EstimatedBytes
+	// Decide what this run has to do, and how big it is. Skipped tables cost
+	// nothing and resumed ones already did, so neither belongs in the total.
+	type job struct {
+		index int // position in dbm.Tables, which names the spool file
+		pos   int // 1-based position for display
+		t     *model.Table
 	}
+	var jobs []job
+	var totalBytes int64
 
 	for i := range dbm.Tables {
 		t := &dbm.Tables[i]
@@ -331,9 +327,7 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 			opts.log("  %-50s %10s", t.Schema+"."+t.Name, "(data skipped)")
 			continue
 		}
-
-		identity := strings.ToLower(t.Schema + "." + t.Name)
-		if st, done := states[identity]; done {
+		if st, done := states[strings.ToLower(t.Schema+"."+t.Name)]; done {
 			t.RowCount, t.DataFile = st.Rows, st.Entry
 			res.Rows += st.Rows
 			res.DataBytes += int64(st.UncompressedSize)
@@ -342,21 +336,80 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 				t.Schema+"."+t.Name, st.Rows, humanBytes(int64(st.UncompressedSize)))
 			continue
 		}
-
-		st, err := dumpTable(ctx, db, sp, i, t, opts, i+1, len(dbm.Tables), all)
-		if err != nil {
-			return fmt.Errorf("dump %s.%s: %w", t.Schema, t.Name, err)
-		}
-		all.done += t.EstimatedBytes
-		if st.Entry == "" {
-			continue // no insertable columns; nothing was spooled
-		}
-		states[identity] = st
-		t.RowCount, t.DataFile = st.Rows, st.Entry
-		res.Rows += st.Rows
-		res.DataBytes += int64(st.UncompressedSize)
+		jobs = append(jobs, job{index: i, pos: i + 1, t: t})
+		totalBytes += t.EstimatedBytes
 	}
-	return nil
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	// Largest first. The run cannot finish before its biggest table does, so
+	// starting that one last would leave the other workers idle at the end.
+	sort.SliceStable(jobs, func(a, b int) bool {
+		return jobs[a].t.EstimatedBytes > jobs[b].t.EstimatedBytes
+	})
+
+	workers := opts.Parallel
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(jobs) {
+		workers = len(jobs)
+	}
+
+	tr := newTracker(totalBytes)
+	stop := make(chan struct{})
+	interval := opts.ProgressInterval
+	if interval == 0 {
+		interval = 5 * time.Second
+	}
+	go tr.report(opts, len(dbm.Tables), interval, stop)
+	defer close(stop)
+
+	var (
+		mu       sync.Mutex // guards states, res and firstErr
+		firstErr error
+		next     int64 = -1
+	)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(atomic.AddInt64(&next, 1))
+				if i >= len(jobs) {
+					return
+				}
+				j := jobs[i]
+
+				st, err := dumpTable(runCtx, db, sp, j.index, j.t, opts, j.pos, len(dbm.Tables), tr)
+
+				mu.Lock()
+				if err != nil {
+					if firstErr == nil {
+						firstErr = fmt.Errorf("dump %s.%s: %w", j.t.Schema, j.t.Name, err)
+						cancel()
+					}
+					mu.Unlock()
+					continue
+				}
+				if st.Entry != "" {
+					states[strings.ToLower(j.t.Schema+"."+j.t.Name)] = st
+					// Only this goroutine touches this table's element.
+					j.t.RowCount, j.t.DataFile = st.Rows, st.Entry
+					res.Rows += st.Rows
+					res.DataBytes += int64(st.UncompressedSize)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
 }
 
 // packageArchive assembles the finished archive from the work directory.
@@ -494,7 +547,7 @@ func warnUntrustedKeys(dbm *model.Database, opts Options) {
 // dumpTable writes one table's rows and reports how many, and how many
 // uncompressed bytes they took.
 func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *model.Table,
-	opts Options, pos, total int, all *overall) (spool.TableState, error) {
+	opts Options, pos, total int, tr *tracker) (spool.TableState, error) {
 
 	var none spool.TableState
 	cols := dataColumns(*t)
@@ -547,18 +600,16 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *m
 	}
 	defer rows.Close()
 
-	// Progress is reported on a timer rather than every N rows. A row count
-	// says nothing about how long a table will take - one table's rows are
-	// four integers, another's are megabyte blobs - so a fixed row interval
-	// either spams the small tables or goes silent for minutes on the big one.
-	interval := opts.ProgressInterval
-	if interval == 0 {
-		interval = 5 * time.Second
+	// Counters the reporter goroutine reads; it decides when to draw, so this
+	// loop only has to keep them current.
+	run := &tableRun{
+		table: t.Schema + "." + t.Name, index: pos,
+		estRows: estimated, estBytes: t.EstimatedBytes,
 	}
+	tr.begin(run)
+	defer tr.finish(run)
 
 	var n int64
-	start := time.Now()
-	lastReport := start
 	buf := make([]any, 0, len(cols))
 	for rows.Next() {
 		if err := rows.Scan(codec.ScanDest()...); err != nil {
@@ -569,28 +620,15 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, index int, t *m
 		}
 		n++
 
-		// time.Now on every row would be wasteful; rows are cheap and the
-		// clock is not, so only look every so often. A blob table can take
-		// seconds per row, so also check on the very first few.
-		if interval > 0 && (n%64 == 0 || n < 8) {
-			if now := time.Now(); now.Sub(lastReport) >= interval {
-				lastReport = now
-				opts.progress(Progress{
-					Table:         t.Schema + "." + t.Name,
-					TableIndex:    pos,
-					TableCount:    total,
-					Rows:          n,
-					EstimatedRows: estimated,
-					TableBytes:    t.EstimatedBytes,
-					Bytes:         cw.n,
-					Elapsed:       now.Sub(start),
-					TotalBytes:    all.total,
-					DoneBytes:     all.done,
-					TotalElapsed:  now.Sub(all.started),
-				})
-			}
+		// Publishing every row would be wasteful and pointless: the reporter
+		// only looks every few seconds.
+		if n%64 == 0 {
+			run.rows.Store(n)
+			run.bytes.Store(cw.n)
 		}
 	}
+	run.rows.Store(n)
+	run.bytes.Store(cw.n)
 	if err := rows.Err(); err != nil {
 		return none, err
 	}
