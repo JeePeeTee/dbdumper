@@ -191,7 +191,9 @@ to read it and does not try. Get the plaintext from whatever code in your app de
 --force                overwrite --out if it exists
 --resume               continue an export interrupted earlier
 --restart              discard an interrupted export and start over
---parallel <n>         tables read concurrently                (default 4)
+--parallel <n>         pieces read concurrently                (default 4)
+--chunk-min-bytes <n>  split tables above this size into ranges (default 128MB;
+                       -1 disables)
 --schema-only          definitions only, no rows
 --include <glob>       only these tables, glob on schema.table, repeatable
 --exclude <glob>       omit these tables entirely, definition included, repeatable
@@ -238,9 +240,45 @@ How much this buys depends on where the time goes, and the ceiling is the
 | 6 | 25.2s |
 
 Two workers collect the whole gain and more add nothing, because everything else
-finishes long before the big table does. Over a network the picture differs:
-each connection is latency-bound rather than CPU-bound, so more of them keep
-paying off until the link saturates.
+finishes long before the big table does.
+
+That ceiling is what **splitting a table into ranges** removes. A table above
+`--chunk-min-bytes` whose clustered index has a single, orderable key column is
+divided into ranges that are read at the same time:
+
+```
+  dbo.FileData                                split into 12 ranges on [Oid]
+```
+
+| | time |
+| --- | ---: |
+| `--parallel 1` | 36.1s |
+| `--parallel 6` | 24.8s |
+| `--parallel 6`, splitting on | **9.2s** |
+
+Boundaries come from the server — `NTILE` over a `TABLESAMPLE` of the key — so
+they respect its ordering rather than the client's. That matters for
+`uniqueidentifier`, which SQL Server compares by its last six bytes first, so
+neither byte order nor the order the text form suggests would divide it evenly.
+
+**Correctness does not depend on the boundaries being well chosen.** The ranges
+are consecutive and half-open over the same ordering the server compares with,
+so they partition the table whatever the values are; a poor boundary makes one
+range larger than another, it cannot lose or duplicate a row. Keys that are NULL
+get a range of their own, since no comparison would match them.
+
+A split table's rows arrive as several archive entries, listed in the manifest
+as `dataFiles`, and the importer loads them in order. The division is recorded
+in the work directory, so a `--resume` reads the remaining ranges with the
+boundaries the first run used rather than recomputing them from data that has
+moved on.
+
+A table is read in one piece when it is below the threshold, is a heap, has a
+composite or unorderable clustered key, or when the sample cannot produce
+distinct boundaries.
+
+Over a network the picture differs again: each connection is latency-bound
+rather than CPU-bound, so more workers keep paying off until the link saturates.
 
 Output does not depend on the worker count. Tables are written to the archive in
 catalogue order however they were read, so an archive produced with `--parallel 8`

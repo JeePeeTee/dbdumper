@@ -21,7 +21,9 @@ func runExport(ctx context.Context, args []string) error {
 	force := fs.Bool("force", false, "overwrite --out if it already exists")
 	resume := fs.Bool("resume", false, "continue an export interrupted earlier")
 	restart := fs.Bool("restart", false, "discard an interrupted export and start over")
-	parallel := fs.Int("parallel", 4, "tables to read concurrently")
+	parallel := fs.Int("parallel", 4, "pieces of work to read concurrently")
+	chunkMin := fs.Int64("chunk-min-bytes", export.DefaultChunkMinBytes,
+		"split tables larger than this into ranges read in parallel; -1 disables splitting")
 	var include, exclude, excludeData, where stringList
 	fs.Var(&include, "include", "only these tables; glob on schema.table, repeatable")
 	fs.Var(&exclude, "exclude", "omit these tables entirely, definition included; repeatable")
@@ -75,6 +77,7 @@ func runExport(ctx context.Context, args []string) error {
 		ExcludeData:      excludeData,
 		Where:            where,
 		Parallel:         *parallel,
+		ChunkMinBytes:    *chunkMin,
 		Resume:           *resume,
 		Restart:          *restart,
 		Log:              logf,

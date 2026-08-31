@@ -23,8 +23,30 @@ type dataHeader struct {
 	Columns []string `json:"columns"`
 }
 
+// loadTable loads every entry belonging to a table. A table read in ranges
+// arrives as several entries; they share one pinned connection and one
+// IDENTITY_INSERT scope, so they are loaded one after another rather than
+// opened all at once.
 func loadTable(ctx context.Context, db *sql.DB, ar *archive.Reader, t model.Table, opts Options) (int64, error) {
-	rc, err := ar.OpenEntry(t.DataFile)
+	var total int64
+	for _, entry := range t.DataEntries() {
+		if !ar.HasEntry(entry) {
+			return total, fmt.Errorf("archive entry %q is missing", entry)
+		}
+		n, err := loadEntry(ctx, db, ar, t, entry, opts)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	if len(t.DataEntries()) > 1 {
+		opts.log("  %-50s %10d rows  (%d ranges)", t.Schema+"."+t.Name, total, len(t.DataEntries()))
+	}
+	return total, nil
+}
+
+func loadEntry(ctx context.Context, db *sql.DB, ar *archive.Reader, t model.Table, entry string, opts Options) (int64, error) {
+	rc, err := ar.OpenEntry(entry)
 	if err != nil {
 		return 0, err
 	}
