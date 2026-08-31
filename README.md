@@ -5,6 +5,12 @@ single portable archive, and restores that archive into a new database. Same ide
 `.bacpac`, but the format is plain zip + JSON + SQL, so you can read it, diff it and script it
 without DacFx or SSMS.
 
+![Terminal recording of dbdumper exporting a 33-table database: a progress bar, row counts and an ETA update in place, finishing in five seconds](docs/demo.gif)
+
+*A real run, not a mock-up: 33 tables and 1,008,720 rows in 5.1 seconds, recorded from the tool's
+own output. The large table is split into ranges read in parallel — see
+[reading tables in parallel](#reading-tables-in-parallel).*
+
 It is not the right tool for every job — see [when not to use this](#when-not-to-use-this) before
 reaching for it on a large cloud database.
 
