@@ -44,6 +44,14 @@ const (
 )
 
 func kindOf(c model.Column) kind {
+	// Before the switch, because SystemType resolves vector to varbinary and
+	// would send it down the base64 path. The driver hands a vector back as
+	// its JSON text - "[1.5000000e+000,-2.0000000e+000]" - and takes it back
+	// the same way; sending it as bytes fails with "Operand type clash:
+	// varbinary is incompatible with vector" (206).
+	if c.IsVector() {
+		return kindString
+	}
 	switch c.SystemType() {
 	case "bit":
 		return kindBool

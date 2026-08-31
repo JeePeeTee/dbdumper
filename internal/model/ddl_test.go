@@ -48,6 +48,19 @@ func TestTypeRef(t *testing.T) {
 		{"time", Column{TypeName: "time", Scale: 3}, "[time](3)"},
 		{"datetimeoffset", Column{TypeName: "datetimeoffset", Scale: 0}, "[datetimeoffset](0)"},
 		{"int", Column{TypeName: "int", Precision: 10}, "[int]"},
+		// vector needs its dimension count, which the server reports only as a
+		// storage size: an 8-byte header plus a float32 per dimension. Without
+		// it, CREATE TABLE fails with "Cannot find data type vector" (2715),
+		// which reads as though the type were unsupported.
+		{"vector", Column{TypeName: "vector", BaseTypeName: "varbinary", MaxLength: 6152},
+			"[vector](1536)"},
+		{"small vector", Column{TypeName: "vector", BaseTypeName: "varbinary", MaxLength: 20},
+			"[vector](3)"},
+		// A size that cannot be a vector is left bare rather than guessed at.
+		{"vector of unreadable size", Column{TypeName: "vector", BaseTypeName: "varbinary", MaxLength: 7},
+			"[vector]"},
+		// A user-defined type that happens to be called vector is not one.
+		{"user type named vector", Column{TypeSchema: "dbo", TypeName: "vector"}, "[dbo].[vector]"},
 		{"uniqueidentifier", Column{TypeName: "uniqueidentifier", MaxLength: 16}, "[uniqueidentifier]"},
 		{"geography", Column{TypeName: "geography", MaxLength: -1}, "[geography]"},
 		// A user-defined alias carries its own length; do not restate it.
