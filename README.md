@@ -450,11 +450,21 @@ seconds with bulk copy and about 11 minutes with `--no-bulk`.
 | User-defined types | scalar alias types and table types |
 | Data | every row of every non-excluded table |
 
-Not captured: users, roles and permissions; XML and spatial indexes; partition schemes and
-filegroups (everything lands on `PRIMARY`); Always Encrypted keys; temporal-table system
-versioning; CLR assemblies; full-text catalogs; extended properties; constraints declared
-*inside* a table type (its columns are reproduced, its primary key is not). Objects it cannot
-reproduce are reported as warnings at export time rather than silently dropped.
+Not captured: database users, roles and permissions; database master keys and database-scoped
+credentials; XML and spatial indexes; partition schemes and filegroups (everything lands on
+`PRIMARY`); Always Encrypted keys; temporal-table system versioning; CLR assemblies; full-text
+catalogs; extended properties; constraints declared *inside* a table type (its columns are
+reproduced, its primary key is not). Objects it cannot reproduce are reported as warnings at
+export time rather than silently dropped.
+
+Do not read that list as "a `.bacpac` would have kept these". A bacpac carries contained database
+users where they exist, but never server logins, and on the 403-table database used for the
+comparisons below its `model.xml` contained no user, role or permission elements at all — the same
+403 tables, 403 primary keys, 1,091 indexes, 708 foreign keys and 13 views this tool records, and
+nothing about security. What it did carry that this does not is a database master key and two
+database-scoped credentials. If you need permissions reproduced, neither format is the answer:
+script them with `mssql-scripter` or SSMS's Generate Scripts, which read `sys.database_principals`
+and `sys.database_permissions` directly.
 
 ## Archive format
 
@@ -536,7 +546,10 @@ read by humans. That buys selectivity and transparency, and costs throughput and
 jobs are better served by something else.
 
 **Copying a large database out of Azure SQL wholesale.** Use a `.bacpac` produced *server-side*,
-so the extract never touches your connection:
+so the extract never touches your connection. Not because a bacpac holds more — on the database
+these notes were written against the two artifacts came out within 2% of each other, 488 MB
+against 498 MB, describing the same 403 tables — but because the extract runs inside Azure instead
+of across your link:
 
 ```bash
 az sql db export --resource-group <rg> --server <server> --name <database> \
@@ -561,9 +574,11 @@ in one table can be newer than rows in another. A resumed export widens that win
 consistency across tables matters, copy or restore the database on the server first and dump the
 copy.
 
-**Users, roles and permissions.** Not captured, deliberately — see
-[what gets captured](#what-gets-captured) for the full list of what is left out. Script those with
-DacFx or `mssql-scripter`, or manage them separately.
+**Users, roles and permissions.** Not captured — see
+[what gets captured](#what-gets-captured) for the full list of what is left out. Script them with
+`mssql-scripter` or SSMS's Generate Scripts, which read the security catalogue directly. A
+`.bacpac` is not the alternative here: it carries contained users at best and no server logins at
+all.
 
 **Loading one large table as fast as physically possible.** `bcp` with a native-format file will
 beat this; it does one thing.
