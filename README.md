@@ -307,6 +307,40 @@ is byte-identical to one produced with `--parallel 1`.
 Work is scheduled largest-first, since the run cannot end before its biggest
 table does and starting that one last would leave the other workers idle.
 
+### Dumping the schema without the data
+
+`--schema-only` writes the manifest and the DDL and nothing else. It is the whole-database
+counterpart to `--exclude-data`, which works a table at a time:
+
+```bash
+dbdumper export --server "DEVBOX\SQLEXPRESS" --database AppDb --out AppDb.dbdump --schema-only
+```
+
+The data path is skipped rather than filtered: no table is read, and the archive contains no
+`data/` entries at all. The cost of the run is the schema pass alone, which scales with the number
+of objects rather than with how much data the database holds — a 4 TB database and a 4 MB one with
+the same schema take about the same time.
+
+That makes it usable as a nightly job that keeps a database's shape under version control:
+
+```bash
+for db in AppDb Billing Reporting; do
+  dbdumper export --server "$SQLHOST" --database "$db" --out "schema/$db.dbdump" --schema-only --force
+done
+git add schema && git commit -m "nightly schema snapshot"
+```
+
+Two things to know before relying on that:
+
+- Output is **not yet byte-identical between runs**, so a nightly commit can show changes even when
+  nothing in the database moved. See [#21](https://github.com/JeePeeTee/dbdumper/issues/21).
+- A schema-only archive restores as **empty tables**, which is the point — but `verify` then
+  compares zero rows against zero rows and reports `OK`. That is correct and still worth expecting.
+
+`import` has its own `--schema-only`, which creates the objects from an archive and loads no rows
+even when the archive has data in it. The two flags are independent: either end can be
+schema-only.
+
 ### Taking part of a table
 
 `--exclude-data` is all-or-nothing. `--where` keeps a slice instead:
@@ -477,15 +511,18 @@ catalogs; extended properties; constraints declared *inside* a table type (its c
 reproduced, its primary key is not). Objects it cannot reproduce are reported as warnings at
 export time rather than silently dropped.
 
-Do not read that list as "a `.bacpac` would have kept these". A bacpac carries contained database
-users where they exist, but never server logins, and on the 403-table database used for the
-comparisons below its `model.xml` contained no user, role or permission elements at all — the same
-403 tables, 403 primary keys, 1,091 indexes, 708 foreign keys and 13 views this tool records, and
-nothing about security. What it did carry that this does not is a database master key and two
-database-scoped credentials. If you need permissions reproduced, neither format is the answer:
-script them with [dbatools](https://dbatools.io) — `Export-DbaLogin` and `Export-DbaUser` — or
-SSMS's Generate Scripts, both of which read `sys.database_principals` and
-`sys.database_permissions` directly.
+Do not read that list as "a `.bacpac` keeps none of these". It keeps more than this tool does: a
+bacpac carries database users and database roles. What it does not carry is the **server logins**
+behind them, so those users arrive orphaned in the target and someone has to remap them by hand.
+
+On the 403-table database used for the comparisons below, that bacpac's `model.xml` happened to
+contain no user, role or permission elements at all — but that is a fact about one database, not
+about the format, and an earlier version of this file wrongly generalised it into one. What it did
+carry that this does not is a database master key and two database-scoped credentials.
+
+If you need permissions reproduced faithfully, neither format is the answer: script them with
+[dbatools](https://dbatools.io) — `Export-DbaLogin` and `Export-DbaUser` — or SSMS's Generate
+Scripts, both of which read `sys.database_principals` and `sys.database_permissions` directly.
 
 ## Archive format
 
@@ -567,10 +604,10 @@ read by humans. That buys selectivity and transparency, and costs throughput and
 jobs are better served by something else.
 
 **Copying a large database out of Azure SQL wholesale.** Use a `.bacpac` produced *server-side*,
-so the extract never touches your connection. Not because a bacpac holds more — on the database
-these notes were written against the two artifacts came out within 2% of each other, 488 MB
-against 498 MB, describing the same 403 tables — but because the extract runs inside Azure instead
-of across your link:
+so the extract never touches your connection. Not because the artifact is smaller — on the
+database these notes were written against the two came out within 2% of each other, 488 MB against
+498 MB, describing the same 403 tables — but because the extract runs inside Azure instead of
+across your link:
 
 ```bash
 az sql db export --resource-group <rg> --server <server> --name <database> \
@@ -598,8 +635,8 @@ copy.
 **Users, roles and permissions.** Not captured — see
 [what gets captured](#what-gets-captured) for the full list of what is left out. Script them with
 [dbatools](https://dbatools.io) (`Export-DbaLogin`, `Export-DbaUser`) or SSMS's Generate Scripts,
-which read the security catalogue directly. A `.bacpac` is not the alternative here: it carries
-contained users at best and no server logins at all.
+which read the security catalogue directly. A `.bacpac` is only a partial alternative: it carries
+database users and roles, but not the server logins behind them, so they restore orphaned.
 
 Microsoft's `mssql-scripter` used to be the obvious cross-platform answer, and earlier versions of
 this README recommended it. It is
@@ -615,7 +652,11 @@ DacFx are.
 ### When it is the right tool
 
 - Pulling *part* of a database — `--exclude-data` on a log table turned one 5 GB transfer into
-  1.4 GB, where a `.bacpac` is all-or-nothing.
+  1.4 GB. `sqlpackage` can do that much with `/p:TableData=`, but not a row filter within a table,
+  and never a subset of the schema.
+- Keeping a database's shape in version control — see
+  [dumping the schema without the data](#dumping-the-schema-without-the-data), which costs the same
+  whether the database holds 4 MB or 4 TB.
 - Wanting to read, grep or diff what you dumped, or edit `manifest.json` before restoring.
 - Restoring somewhere with nothing installed: one static binary, no DacFx, no SSMS.
 - Restoring into a differently named database, or a subset of tables, without ceremony.

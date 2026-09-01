@@ -46,7 +46,8 @@ Advantages that follow from the design rather than from a measurement.
 
 ### Export only part of a database
 
-A `.bacpac` is all-or-nothing: every table, every row.
+`sqlpackage` is not all-or-nothing — `/p:TableData=` selects which tables' data to include — but
+the subsetting stops at whole tables. There is no row filter, and the schema is always complete.
 
 ```bash
 dbdumper export --include 'sales.*' --exclude-data LogEvents \
