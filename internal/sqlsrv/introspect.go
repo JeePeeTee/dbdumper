@@ -18,6 +18,12 @@ type Introspector struct {
 	DB     *sql.DB
 	Filter TableFilter
 	Warn   func(format string, args ...any)
+
+	// cachedColumns holds the one columns query's result. It covers every table
+	// and table type in the database, and both callers want the whole thing, so
+	// running it twice reads the same rows twice - on a large schema that is the
+	// most expensive query there is.
+	cachedColumns map[int64][]model.Column
 }
 
 func (in *Introspector) warn(format string, args ...any) {
@@ -308,6 +314,9 @@ GROUP BY s.name, t.name`)
 }
 
 func (in *Introspector) columns(ctx context.Context) (map[int64][]model.Column, error) {
+	if in.cachedColumns != nil {
+		return in.cachedColumns, nil
+	}
 	q := `
 SELECT c.object_id, c.column_id, c.name,
        CASE WHEN ty.is_user_defined = 1 THEN ts.name ELSE N'' END,
@@ -351,7 +360,11 @@ ORDER BY c.object_id, c.column_id`
 		}
 		out[id] = append(out[id], c)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	in.cachedColumns = out
+	return out, nil
 }
 
 func (in *Introspector) loadIndexes(ctx context.Context, tables []model.Table, byID map[int64]int) error {
@@ -506,7 +519,7 @@ ORDER BY fk.name`)
 
 func (in *Introspector) loadChecks(ctx context.Context, tables []model.Table, byID map[int64]int) error {
 	rows, err := in.DB.QueryContext(ctx, `
-SELECT cc.parent_object_id, cc.name, cc.definition, cc.is_disabled
+SELECT cc.parent_object_id, cc.name, cc.definition, cc.is_disabled, cc.is_not_trusted
 FROM sys.check_constraints cc
 JOIN sys.objects o ON o.object_id = cc.parent_object_id AND o.is_ms_shipped = 0 AND o.type = 'U'
 ORDER BY cc.name`)
@@ -518,7 +531,7 @@ ORDER BY cc.name`)
 	for rows.Next() {
 		var parentID int64
 		var cc model.CheckConstraint
-		if err := rows.Scan(&parentID, &cc.Name, &cc.Definition, &cc.IsDisabled); err != nil {
+		if err := rows.Scan(&parentID, &cc.Name, &cc.Definition, &cc.IsDisabled, &cc.IsNotTrusted); err != nil {
 			return err
 		}
 		i, ok := byID[parentID]
@@ -678,7 +691,7 @@ WHERE t.is_ms_shipped = 0 AND t.type = 'U'`)
 // entity it references.
 func moduleDependencies(ctx context.Context, db *sql.DB) (map[string][]string, error) {
 	rows, err := db.QueryContext(ctx, `
-SELECT DISTINCT ss.name, so.name, ISNULL(d.referenced_schema_name, SCHEMA_NAME()), d.referenced_entity_name
+SELECT DISTINCT ss.name, so.name, ISNULL(d.referenced_schema_name, ss.name), d.referenced_entity_name
 FROM sys.sql_expression_dependencies d
 JOIN sys.objects so ON so.object_id = d.referencing_id
 JOIN sys.schemas ss ON ss.schema_id = so.schema_id
@@ -714,7 +727,7 @@ func orderModulesByDependency(ctx context.Context, db *sql.DB, mods []model.Modu
 	}
 
 	rows, err := db.QueryContext(ctx, `
-SELECT DISTINCT ss.name, so.name, ISNULL(d.referenced_schema_name, SCHEMA_NAME()), d.referenced_entity_name
+SELECT DISTINCT ss.name, so.name, ISNULL(d.referenced_schema_name, ss.name), d.referenced_entity_name
 FROM sys.sql_expression_dependencies d
 JOIN sys.objects so ON so.object_id = d.referencing_id
 JOIN sys.schemas ss ON ss.schema_id = so.schema_id

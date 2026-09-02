@@ -246,8 +246,11 @@ func (fk ForeignKey) AddDDL(table Table) string {
 
 // AddDDL renders the ALTER TABLE statement that creates this check constraint.
 func (cc CheckConstraint) AddDDL(table Table) string {
+	// A disabled constraint is not enforced, and an untrusted one was never
+	// verified against the rows already present. Either way, asking the server
+	// to validate it now is asking it to fail.
 	check := "WITH CHECK"
-	if cc.IsDisabled {
+	if cc.IsDisabled || cc.IsNotTrusted {
 		check = "WITH NOCHECK"
 	}
 	return fmt.Sprintf("ALTER TABLE %s %s ADD CONSTRAINT %s CHECK %s",

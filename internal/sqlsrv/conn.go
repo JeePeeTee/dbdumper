@@ -57,6 +57,19 @@ func (c ConnConfig) String() string {
 	if host == "" {
 		host = "localhost"
 	}
+	// "host,port" is how SQL Server's own tools spell a port, and --server
+	// advertises it. Left in place it becomes part of the hostname and the
+	// connection goes nowhere useful.
+	port := c.Port
+	if i := strings.LastIndex(host, ","); i >= 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(host[i+1:])); err == nil && n > 0 {
+			host = strings.TrimSpace(host[:i])
+			if port == 0 {
+				// An explicit --port wins; this is only the fallback.
+				port = n
+			}
+		}
+	}
 	// "host\instance" must go into the path, not the authority.
 	if i := strings.Index(host, `\`); i >= 0 {
 		u.Host = host[:i]
@@ -64,8 +77,8 @@ func (c ConnConfig) String() string {
 	} else {
 		u.Host = host
 	}
-	if c.Port > 0 {
-		u.Host = fmt.Sprintf("%s:%d", u.Host, c.Port)
+	if port > 0 {
+		u.Host = fmt.Sprintf("%s:%d", u.Host, port)
 	}
 	if !c.Trusted && c.User != "" {
 		u.User = url.UserPassword(c.User, c.Password)

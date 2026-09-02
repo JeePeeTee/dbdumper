@@ -260,3 +260,28 @@ func TestColumnstoreIndexHasNoSortOrder(t *testing.T) {
 		t.Errorf("rowstore index lost its sort order: %s", rb.CreateIndexDDL(tbl))
 	}
 }
+
+// TestUntrustedCheckConstraintIsRecreatedUnvalidated - SQL Server lets a check
+// constraint be enabled but never verified against the rows already in the
+// table. Recreating one of those WITH CHECK asks the server to verify them now,
+// which fails on exactly the data the flag records. Foreign keys have always
+// handled this; check constraints did not.
+func TestUntrustedCheckConstraintIsRecreatedUnvalidated(t *testing.T) {
+	table := Table{Schema: "dbo", Name: "T"}
+	cases := []struct {
+		name string
+		cc   CheckConstraint
+		want string
+	}{
+		{"ordinary", CheckConstraint{Name: "CK", Definition: "([Qty]>(0))"}, "WITH CHECK"},
+		{"disabled", CheckConstraint{Name: "CK", Definition: "([Qty]>(0))", IsDisabled: true}, "WITH NOCHECK"},
+		{"untrusted", CheckConstraint{Name: "CK", Definition: "([Qty]>(0))", IsNotTrusted: true}, "WITH NOCHECK"},
+		{"both", CheckConstraint{Name: "CK", Definition: "([Qty]>(0))", IsDisabled: true, IsNotTrusted: true}, "WITH NOCHECK"},
+	}
+	for _, c := range cases {
+		got := c.cc.AddDDL(table)
+		if !strings.Contains(got, c.want) {
+			t.Errorf("%s: expected %s in:\n  %s", c.name, c.want, got)
+		}
+	}
+}

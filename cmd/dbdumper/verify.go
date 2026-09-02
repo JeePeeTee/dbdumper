@@ -173,6 +173,12 @@ WHERE o.is_ms_shipped = 0 AND o.type IN ('V','P','FN','IF','TF','TR')`)
 		}
 		out[strings.ToLower(kind+":"+s+"."+n)] = true
 	}
+	// Without this a connection dropped part way through reads as "every object
+	// after this point is missing", which is a confident and wrong answer.
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
 	rows.Close()
 
 	queries := []struct{ prefix, sql string }{
@@ -198,6 +204,10 @@ JOIN sys.schemas s ON s.schema_id = cc.schema_id`},
 				return nil, err
 			}
 			out[strings.ToLower(q.prefix+":"+name)] = true
+		}
+		if err := r.Err(); err != nil {
+			r.Close()
+			return nil, err
 		}
 		r.Close()
 	}
