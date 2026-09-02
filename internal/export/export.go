@@ -40,6 +40,11 @@ type Options struct {
 	// ranges that can be read at the same time. Zero uses the default; a
 	// negative value turns splitting off.
 	ChunkMinBytes int64
+	// SchemaDir, when set, additionally writes the DDL as one file per object
+	// into that directory, deleting the files of objects that no longer exist.
+	// Intended for keeping a schema in version control, where a change to one
+	// object should be a change to one file.
+	SchemaDir string
 	// Deterministic makes two exports of an unchanged database produce
 	// byte-identical archives: rows are read in primary key order, the
 	// manifest records no creation time, and tables are not split into ranges,
@@ -208,7 +213,11 @@ type Result struct {
 	// ResumedTables counts tables taken from an interrupted run's work
 	// directory rather than read from the database again.
 	ResumedTables int
-	Duration      time.Duration
+	// SchemaFilesWritten and SchemaFilesRemoved report what --schema-dir did.
+	// Written counts only files whose contents changed.
+	SchemaFilesWritten int
+	SchemaFilesRemoved int
+	Duration           time.Duration
 }
 
 // Run performs the dump.
@@ -272,6 +281,16 @@ func Run(ctx context.Context, db *sql.DB, opts Options) (*Result, error) {
 	}
 
 	warnUntrustedKeys(dbm, opts)
+
+	if opts.SchemaDir != "" {
+		sd, err := writeSchemaDir(opts.SchemaDir, dbm, opts)
+		if err != nil {
+			return nil, fmt.Errorf("write schema directory %s: %w", opts.SchemaDir, err)
+		}
+		res.SchemaFilesWritten, res.SchemaFilesRemoved = sd.Written, sd.Removed
+		opts.log("schema directory %s: %d file(s) written, %d removed",
+			opts.SchemaDir, sd.Written, sd.Removed)
+	}
 
 	if err := packageArchive(sp, states, dbm, src, opts); err != nil {
 		return nil, err

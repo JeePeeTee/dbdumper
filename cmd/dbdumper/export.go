@@ -19,6 +19,8 @@ func runExport(ctx context.Context, args []string) error {
 	out := fs.String("out", "", "archive to write (required)")
 	schemaOnly := fs.Bool("schema-only", false, "dump definitions but no rows")
 	force := fs.Bool("force", false, "overwrite --out if it already exists")
+	schemaDir := fs.String("schema-dir", "",
+		"also write the DDL as one .sql file per object into this directory, removing files for dropped objects")
 	deterministic := fs.Bool("deterministic", false,
 		"byte-identical archives for an unchanged database: rows in primary key order, no creation time, no range splitting")
 	resume := fs.Bool("resume", false, "continue an export interrupted earlier")
@@ -81,6 +83,7 @@ func runExport(ctx context.Context, args []string) error {
 		Parallel:         *parallel,
 		ChunkMinBytes:    *chunkMin,
 		Deterministic:    *deterministic,
+		SchemaDir:        *schemaDir,
 		Resume:           *resume,
 		Restart:          *restart,
 		Log:              logf,
