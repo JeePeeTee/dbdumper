@@ -40,6 +40,15 @@ type Options struct {
 	// ranges that can be read at the same time. Zero uses the default; a
 	// negative value turns splitting off.
 	ChunkMinBytes int64
+	// Deterministic makes two exports of an unchanged database produce
+	// byte-identical archives: rows are read in primary key order, the
+	// manifest records no creation time, and tables are not split into ranges,
+	// since range boundaries come from a live sample and would fall in
+	// different places on a second run.
+	//
+	// It costs a sorted read of every table, which is why it is not the
+	// default. Reading tables concurrently is unaffected and stays on.
+	Deterministic bool
 	// Resume continues an interrupted export from its work directory instead
 	// of starting over. Restart discards that directory. With neither, an
 	// existing work directory is an error rather than a silent choice.
@@ -205,6 +214,13 @@ type Result struct {
 // Run performs the dump.
 func Run(ctx context.Context, db *sql.DB, opts Options) (*Result, error) {
 	start := time.Now()
+
+	if opts.Deterministic {
+		// Range boundaries are drawn from a sample of live data, so a second
+		// run would split the same table in different places and the entries
+		// would differ even though the rows did not.
+		opts.ChunkMinBytes = -1
+	}
 
 	in := &sqlsrv.Introspector{
 		DB:     db,
@@ -570,6 +586,10 @@ func packageArchive(sp *spool.Spool, states map[string]spool.TableState,
 		Source:        src,
 		Database:      *dbm,
 	}
+	if opts.Deterministic {
+		// The one field that changes on every run whatever the database does.
+		manifest.CreatedAt = time.Time{}
+	}
 	if err := w.AddJSON(archive.ManifestName, manifest); err != nil {
 		return err
 	}
@@ -770,6 +790,17 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, pc piece,
 	}
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	if opts.Deterministic {
+		// Without a key there is no total order to ask for, and ordering by
+		// every column instead would fail outright on the types SQL Server
+		// will not sort. Such a table is left in whatever order it comes back
+		// in, and the caller is told which ones those are.
+		if order := t.OrderByKey(); order != "" {
+			query += " ORDER BY " + order
+		} else {
+			opts.warn("%s.%s has no primary key, so its row order is not reproducible", t.Schema, t.Name)
+		}
 	}
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {

@@ -215,6 +215,7 @@ to read it and does not try. Get the plaintext from whatever code in your app de
 --chunk-min-bytes <n>  split tables above this size into ranges (default 128MB;
                        -1 disables)
 --schema-only          definitions only, no rows
+--deterministic        byte-identical archives for an unchanged database
 --include <glob>       only these tables, glob on schema.table, repeatable
 --exclude <glob>       omit these tables entirely, definition included, repeatable
 --exclude-data <glob>  keep these tables' definitions but skip their rows, repeatable
@@ -376,6 +377,45 @@ Three consequences worth knowing:
 
 The filter is recorded in the manifest as `rowFilter`, so an archive says on its face that it holds
 a subset.
+
+### Reproducible archives
+
+Two exports of a database nobody has touched normally differ, which makes an archive awkward to
+diff against another and turns a nightly export committed to git into a commit every night whether
+or not anything changed. `--deterministic` removes the differences:
+
+```bash
+dbdumper export --server "DEVBOX\SQLEXPRESS" --database AppDb --out AppDb.dbdump --deterministic
+```
+
+```
+  rows            read in primary key order, so the JSONL is stable
+  manifest        no creation time recorded
+  range splitting off, since boundaries are drawn from a live sample and
+                  would fall elsewhere on a second run
+```
+
+Reading tables concurrently is unaffected and stays on: `--parallel` changes which order tables
+*finish* in, not what any of them contains, and entries are written to the archive in model order
+regardless.
+
+It is not the default because it is materially slower. On a 403-table database of 681,357 rows:
+
+| | |
+| --- | --- |
+| default | 12.5 s |
+| `--deterministic` | 29.4 s |
+
+That is the price of a sorted read of every table and of giving up range splitting on the large
+ones. Byte-identical was confirmed on that database by exporting twice and comparing the files.
+
+**A table with no primary key cannot be ordered**, because there is no set of columns guaranteed
+to be unique — ordering by a non-unique column leaves ties that the engine may break differently
+each time. Such tables are read in whatever order they come back, and the run names them:
+
+```
+warning: dbo.StagingRows has no primary key, so its row order is not reproducible
+```
 
 ### Resuming an interrupted export
 
