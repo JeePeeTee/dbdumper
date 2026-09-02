@@ -27,13 +27,16 @@ const ManifestName = "manifest.json"
 // are not rejected by the zip writer, so one table's rows would silently
 // replace another's.
 func DataPath(schema, table string) string {
-	return path.Join("data", escapeSegment(schema)+"."+escapeSegment(table)+".jsonl")
+	return path.Join("data", EscapeSegment(schema)+"."+EscapeSegment(table)+".jsonl")
 }
 
-// escapeSegment percent-encodes everything that would make an entry name
-// ambiguous or illegal on a filesystem: the separator this package joins with,
-// the characters Windows forbids, and "%" itself so the encoding can be undone.
-func escapeSegment(s string) string {
+// EscapeSegment percent-encodes everything that would make a name ambiguous or
+// illegal on a filesystem: the separator this package joins with, the
+// characters Windows forbids, and "%" itself so the encoding can be undone.
+//
+// Exported because anything else naming a file after a database object needs
+// the same encoding, and two encodings that almost agree are worse than one.
+func EscapeSegment(s string) string {
 	const hex = "0123456789ABCDEF"
 	var b strings.Builder
 	b.Grow(len(s))
@@ -57,7 +60,7 @@ func escapeSegment(s string) string {
 // any listing.
 func ChunkDataPath(schema, table string, chunk int) string {
 	return path.Join("data", fmt.Sprintf("%s.%s.part%03d.jsonl",
-		escapeSegment(schema), escapeSegment(table), chunk))
+		EscapeSegment(schema), EscapeSegment(table), chunk))
 }
 
 // Writer builds an archive. Entries are written sequentially.

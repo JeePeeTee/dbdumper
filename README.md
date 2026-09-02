@@ -216,6 +216,7 @@ to read it and does not try. Get the plaintext from whatever code in your app de
                        -1 disables)
 --schema-only          definitions only, no rows
 --deterministic        byte-identical archives for an unchanged database
+--schema-dir <dir>     also write one .sql file per object into <dir>
 --include <glob>       only these tables, glob on schema.table, repeatable
 --exclude <glob>       omit these tables entirely, definition included, repeatable
 --exclude-data <glob>  keep these tables' definitions but skip their rows, repeatable
@@ -377,6 +378,53 @@ Three consequences worth knowing:
 
 The filter is recorded in the manifest as `rowFilter`, so an archive says on its face that it holds
 a subset.
+
+### One file per object, for version control
+
+An archive is a single file, which git can store but cannot diff. `--schema-dir` writes the same
+DDL a second way, as one `.sql` file per object, so a change to one procedure shows up as a change
+to one file:
+
+```bash
+dbdumper export --server "DEVBOX\SQLEXPRESS" --database AppDb --out AppDb.dbdump \
+                --schema-only --schema-dir schema/
+```
+
+```
+schema/
+  schemas/      sales.sql
+  types/        dbo.PhoneNumber.sql
+  sequences/    dbo.OrderNumber.sql
+  tables/       sales.Customer.sql        table, indexes and check constraints
+  foreignkeys/  sales.Order.sql           kept apart, so every table exists first
+  views/        dbo.vActiveCustomer.sql
+  functions/    dbo.fnTax.sql
+  procedures/   dbo.pPlaceOrder.sql
+  triggers/     dbo.trOrderAudit.sql
+```
+
+A table's own indexes and constraints live in its file, because they change with it. Foreign keys
+name a second table, so they get files of their own that can all be applied once every table
+exists.
+
+**Files for objects that no longer exist are deleted.** Without that a directory records every
+object that has ever existed rather than the ones that do, the git history never shows a drop, and
+the folder slowly fills with dead scripts. Deletion is limited to `.sql` files directly inside the
+directories listed above — a `README.md`, a `.gitattributes`, or anything in a folder not on that
+list is left alone.
+
+Unchanged files are not rewritten, so a nightly run over an untouched database leaves every
+timestamp as it was and produces no commit:
+
+```
+schema directory schema/: 0 file(s) written, 0 removed
+```
+
+Object names are far freer than filenames, so each part is percent-encoded — the same encoding the
+archive uses for data entries, which is injective, so two objects can never collide on one file.
+
+The archive remains the thing you restore from; this directory is for reading and diffing.
+Combine it with `--deterministic` if you also want the archive itself to be stable.
 
 ### Reproducible archives
 
