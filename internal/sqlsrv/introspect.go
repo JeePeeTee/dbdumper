@@ -144,12 +144,16 @@ ORDER BY t.is_table_type, s.name, t.name`)
 	}
 
 	if len(tableIDs) > 0 {
-		cols, err := in.columns(ctx, tableIDs)
+		cols, err := in.columns(ctx)
 		if err != nil {
 			return nil, err
 		}
 		for id, cs := range cols {
-			out[byID[id]].Columns = cs
+			// Covers every table and table type in the database, so most of
+			// these belong to something this loop is not building.
+			if i, ok := byID[id]; ok {
+				out[i].Columns = cs
+			}
 		}
 	}
 	return out, nil
@@ -205,7 +209,6 @@ ORDER BY s.name, t.name`)
 
 	var (
 		tables []model.Table
-		ids    []int64
 		byID   = map[int64]int{}
 	)
 	for rows.Next() {
@@ -218,7 +221,6 @@ ORDER BY s.name, t.name`)
 			continue
 		}
 		byID[id] = len(tables)
-		ids = append(ids, id)
 		tables = append(tables, t)
 	}
 	if err := rows.Err(); err != nil {
@@ -228,21 +230,27 @@ ORDER BY s.name, t.name`)
 		return nil, nil
 	}
 
-	cols, err := in.columns(ctx, ids)
+	cols, err := in.columns(ctx)
 	if err != nil {
 		return nil, err
 	}
 	for id, cs := range cols {
-		tables[byID[id]].Columns = cs
+		// The catalog queries cover every user table, not only the ones this
+		// run keeps, so an id with no entry here belongs to a table the filter
+		// excluded. Indexing without checking would put its columns on
+		// tables[0].
+		if i, ok := byID[id]; ok {
+			tables[i].Columns = cs
+		}
 	}
 
-	if err := in.loadIndexes(ctx, ids, tables, byID); err != nil {
+	if err := in.loadIndexes(ctx, tables, byID); err != nil {
 		return nil, err
 	}
-	if err := in.loadForeignKeys(ctx, ids, tables, byID); err != nil {
+	if err := in.loadForeignKeys(ctx, tables, byID); err != nil {
 		return nil, err
 	}
-	if err := in.loadChecks(ctx, ids, tables, byID); err != nil {
+	if err := in.loadChecks(ctx, tables, byID); err != nil {
 		return nil, err
 	}
 
@@ -299,17 +307,7 @@ GROUP BY s.name, t.name`)
 	return nil
 }
 
-// idList renders object ids as a literal IN-list. The values come from
-// sys.objects, never from user input, so there is nothing to inject.
-func idList(ids []int64) string {
-	parts := make([]string, len(ids))
-	for i, id := range ids {
-		parts[i] = fmt.Sprintf("%d", id)
-	}
-	return strings.Join(parts, ",")
-}
-
-func (in *Introspector) columns(ctx context.Context, ids []int64) (map[int64][]model.Column, error) {
+func (in *Introspector) columns(ctx context.Context) (map[int64][]model.Column, error) {
 	q := `
 SELECT c.object_id, c.column_id, c.name,
        CASE WHEN ty.is_user_defined = 1 THEN ts.name ELSE N'' END,
@@ -326,7 +324,12 @@ JOIN sys.schemas ts ON ts.schema_id = ty.schema_id
 LEFT JOIN sys.identity_columns ic ON ic.object_id = c.object_id AND ic.column_id = c.column_id
 LEFT JOIN sys.computed_columns cc ON cc.object_id = c.object_id AND cc.column_id = c.column_id
 LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id
-WHERE c.object_id IN (` + idList(ids) + `)
+-- Table types are carried here too: their columns live in sys.columns
+-- like any table's. They are matched on type alone because SQL Server
+-- reports a user-created table type with is_ms_shipped = 1, so filtering
+-- on that would drop every one of them.
+JOIN sys.objects o ON o.object_id = c.object_id
+ AND ((o.type = 'U' AND o.is_ms_shipped = 0) OR o.type = 'TT')
 ORDER BY c.object_id, c.column_id`
 
 	rows, err := in.DB.QueryContext(ctx, q)
@@ -351,12 +354,12 @@ ORDER BY c.object_id, c.column_id`
 	return out, rows.Err()
 }
 
-func (in *Introspector) loadIndexes(ctx context.Context, ids []int64, tables []model.Table, byID map[int64]int) error {
+func (in *Introspector) loadIndexes(ctx context.Context, tables []model.Table, byID map[int64]int) error {
 	colRows, err := in.DB.QueryContext(ctx, `
 SELECT ic.object_id, ic.index_id, c.name, ic.is_descending_key, ic.is_included_column
 FROM sys.index_columns ic
 JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-WHERE ic.object_id IN (`+idList(ids)+`)
+JOIN sys.objects o ON o.object_id = ic.object_id AND o.is_ms_shipped = 0 AND o.type = 'U'
 ORDER BY ic.object_id, ic.index_id, ic.is_included_column, ic.key_ordinal, ic.index_column_id`)
 	if err != nil {
 		return fmt.Errorf("read index columns: %w", err)
@@ -386,8 +389,8 @@ SELECT i.object_id, i.index_id, ISNULL(i.name, N''), i.type, i.type_desc,
        ISNULL(i.filter_definition, N''), i.fill_factor, i.is_padded,
        i.ignore_dup_key, i.is_disabled
 FROM sys.indexes i
-WHERE i.object_id IN (`+idList(ids)+`)
-  AND i.type <> 0 AND i.is_hypothetical = 0
+JOIN sys.objects o ON o.object_id = i.object_id AND o.is_ms_shipped = 0 AND o.type = 'U'
+WHERE i.type <> 0 AND i.is_hypothetical = 0
 ORDER BY i.object_id, i.index_id`)
 	if err != nil {
 		return fmt.Errorf("read indexes: %w", err)
@@ -404,7 +407,11 @@ ORDER BY i.object_id, i.index_id`)
 			&ix.IgnoreDupKey, &ix.IsDisabled); err != nil {
 			return err
 		}
-		t := &tables[byID[objID]]
+		i, ok := byID[objID]
+		if !ok {
+			continue // a table this run is not keeping
+		}
+		t := &tables[i]
 		switch indexType {
 		case 1, 2, 5, 6: // clustered, nonclustered, clustered/nonclustered columnstore
 		default:
@@ -425,13 +432,13 @@ ORDER BY i.object_id, i.index_id`)
 	return rows.Err()
 }
 
-func (in *Introspector) loadForeignKeys(ctx context.Context, ids []int64, tables []model.Table, byID map[int64]int) error {
+func (in *Introspector) loadForeignKeys(ctx context.Context, tables []model.Table, byID map[int64]int) error {
 	colRows, err := in.DB.QueryContext(ctx, `
 SELECT fkc.constraint_object_id, pc.name, rc.name
 FROM sys.foreign_key_columns fkc
 JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
 JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
-WHERE fkc.parent_object_id IN (`+idList(ids)+`)
+JOIN sys.objects o ON o.object_id = fkc.parent_object_id AND o.is_ms_shipped = 0 AND o.type = 'U'
 ORDER BY fkc.constraint_object_id, fkc.constraint_column_id`)
 	if err != nil {
 		return fmt.Errorf("read foreign key columns: %w", err)
@@ -465,7 +472,7 @@ SELECT fk.object_id, fk.name, fk.parent_object_id, rs.name, rt.name,
 FROM sys.foreign_keys fk
 JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id
 JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
-WHERE fk.parent_object_id IN (`+idList(ids)+`)
+JOIN sys.objects o ON o.object_id = fk.parent_object_id AND o.is_ms_shipped = 0 AND o.type = 'U'
 ORDER BY fk.name`)
 	if err != nil {
 		return fmt.Errorf("read foreign keys: %w", err)
@@ -482,7 +489,11 @@ ORDER BY fk.name`)
 		if c := cols[fkID]; c != nil {
 			fk.Columns, fk.ReferencedColumns = c.local, c.remote
 		}
-		t := &tables[byID[parentID]]
+		i, ok := byID[parentID]
+		if !ok {
+			continue // a table this run is not keeping
+		}
+		t := &tables[i]
 		if !in.keep(fk.ReferencedSchema, fk.ReferencedTable) {
 			in.warn("skipping foreign key %s on %s.%s: referenced table %s.%s is excluded",
 				fk.Name, t.Schema, t.Name, fk.ReferencedSchema, fk.ReferencedTable)
@@ -493,11 +504,11 @@ ORDER BY fk.name`)
 	return rows.Err()
 }
 
-func (in *Introspector) loadChecks(ctx context.Context, ids []int64, tables []model.Table, byID map[int64]int) error {
+func (in *Introspector) loadChecks(ctx context.Context, tables []model.Table, byID map[int64]int) error {
 	rows, err := in.DB.QueryContext(ctx, `
 SELECT cc.parent_object_id, cc.name, cc.definition, cc.is_disabled
 FROM sys.check_constraints cc
-WHERE cc.parent_object_id IN (`+idList(ids)+`)
+JOIN sys.objects o ON o.object_id = cc.parent_object_id AND o.is_ms_shipped = 0 AND o.type = 'U'
 ORDER BY cc.name`)
 	if err != nil {
 		return fmt.Errorf("read check constraints: %w", err)
@@ -510,8 +521,11 @@ ORDER BY cc.name`)
 		if err := rows.Scan(&parentID, &cc.Name, &cc.Definition, &cc.IsDisabled); err != nil {
 			return err
 		}
-		t := &tables[byID[parentID]]
-		t.CheckConstraints = append(t.CheckConstraints, cc)
+		i, ok := byID[parentID]
+		if !ok {
+			continue // a table this run is not keeping
+		}
+		tables[i].CheckConstraints = append(tables[i].CheckConstraints, cc)
 	}
 	return rows.Err()
 }
