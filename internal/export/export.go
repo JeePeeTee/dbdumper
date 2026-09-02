@@ -389,6 +389,7 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 
 		// A split table's rows arrive as several entries, in key order.
 		t.DataFiles = make([]string, len(chunks))
+		resumedChunks, resumedBytes := 0, int64(0)
 		for k := range chunks {
 			p := piece{
 				tableIndex: i, pos: i + 1, t: t,
@@ -402,13 +403,20 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 				t.RowCount += st.Rows
 				res.Rows += st.Rows
 				res.DataBytes += int64(st.UncompressedSize)
+				resumedChunks++
+				resumedBytes += int64(st.UncompressedSize)
 				continue
 			}
 			pieces = append(pieces, p)
 			totalBytes += p.estBytes
 		}
-		if t.RowCount > 0 && len(pieces) == 0 {
+		// A split table counts as resumed only when every one of its own chunks
+		// was already spooled. The test used to be against the whole run's work
+		// list, which is empty only when nothing at all is left to do.
+		if resumedChunks == len(chunks) {
 			res.ResumedTables++
+			opts.log("  %-50s %10d rows  %10s (resumed, %d ranges)",
+				t.Schema+"."+t.Name, t.RowCount, humanBytes(resumedBytes), len(chunks))
 		}
 	}
 	if len(pieces) == 0 {
@@ -506,6 +514,19 @@ func adoptResumed(t *model.Table, st spool.TableState, res *Result, opts Options
 func planFor(ctx context.Context, in *sqlsrv.Introspector, sp *spool.Spool,
 	t *model.Table, workers int, opts Options) ([]sqlsrv.Chunk, sqlsrv.ChunkKey) {
 
+	minBytes := opts.ChunkMinBytes
+	if minBytes == 0 {
+		minBytes = DefaultChunkMinBytes
+	}
+	// Whether this run may split at all is decided before any saved plan is
+	// consulted. A plan left by an earlier run says how a table *was* divided,
+	// not whether this one is allowed to divide it - and --deterministic turns
+	// splitting off precisely so the output does not depend on boundaries drawn
+	// from a live sample.
+	if minBytes < 0 || workers < 2 {
+		return nil, sqlsrv.ChunkKey{}
+	}
+
 	planKey := strings.ToLower(t.Schema + "." + t.Name)
 	var saved savedPlan
 	if ok, err := sp.LoadPlan(planKey, &saved); err != nil {
@@ -526,11 +547,7 @@ func planFor(ctx context.Context, in *sqlsrv.Introspector, sp *spool.Spool,
 		return chunks, key
 	}
 
-	minBytes := opts.ChunkMinBytes
-	if minBytes == 0 {
-		minBytes = DefaultChunkMinBytes
-	}
-	if minBytes < 0 || workers < 2 || t.EstimatedBytes < minBytes {
+	if t.EstimatedBytes < minBytes {
 		return nil, sqlsrv.ChunkKey{}
 	}
 	key, found := in.ChunkKeyFor(ctx, *t)
@@ -551,13 +568,6 @@ func planFor(ctx context.Context, in *sqlsrv.Introspector, sp *spool.Spool,
 	}
 	opts.log("  %-50s split into %d ranges on [%s]", t.Schema+"."+t.Name, len(chunks), key.Column.Name)
 	return chunks, key
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // packageArchive assembles the finished archive from the work directory.

@@ -275,6 +275,10 @@ type CheckConstraint struct {
 	Name       string `json:"name"`
 	Definition string `json:"definition"`
 	IsDisabled bool   `json:"isDisabled,omitempty"`
+	// IsNotTrusted marks a constraint the server has not verified against the
+	// rows already in the table. Recreating one of those WITH CHECK asks it to
+	// verify them now, which fails on the very data the flag exists to record.
+	IsNotTrusted bool `json:"isNotTrusted,omitempty"`
 }
 
 // ModuleKind groups sys.sql_modules objects by how they must be ordered.

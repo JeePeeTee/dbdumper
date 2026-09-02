@@ -22,11 +22,18 @@ var version = "dev"
 var status = newStatusLine(os.Stderr)
 
 func main() {
+	// os.Exit skips deferred calls, so the whole command runs inside a function
+	// that returns its status and the process exits only once that has
+	// returned. The console code page is restored on the way out of it, which
+	// is the point: it belongs to the window rather than to this process, and
+	// a failed run used to leave the window switched to UTF-8.
+	os.Exit(run())
+}
+
+func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	// The console code page belongs to the window, not to this process, so it
-	// is put back before returning however the command ends.
 	if status.IsTerminal() && enableUnicodeOutput() {
 		useUnicodeGlyphs()
 	}
@@ -34,7 +41,7 @@ func main() {
 
 	if len(os.Args) < 2 {
 		usage()
-		os.Exit(2)
+		return 2
 	}
 
 	var err error
@@ -54,17 +61,18 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
 		usage()
-		os.Exit(2)
+		return 2
 	}
 
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			fmt.Fprintln(os.Stderr, "\ncancelled")
-			os.Exit(130)
+			return 130
 		}
 		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func usage() {
