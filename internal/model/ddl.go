@@ -135,6 +135,20 @@ func plainColumnList(cols []IndexColumn) string {
 	return strings.Join(parts, ", ")
 }
 
+// OrderByKey renders the ORDER BY list that puts this table's rows in a stable
+// order, or "" when there is no key to order by.
+//
+// The primary key is used because it is the one set of columns guaranteed to be
+// unique and non-null, which is what makes the order total rather than merely
+// deterministic-looking: ordering by a non-unique column leaves ties, and the
+// engine is free to break those differently on every run.
+func (t Table) OrderByKey() string {
+	if t.PrimaryKey == nil {
+		return ""
+	}
+	return indexKeyList(t.PrimaryKey.Columns, false)
+}
+
 func (ix Index) withOptions(base string) string {
 	var opts []string
 	if ix.IgnoreDupKey {

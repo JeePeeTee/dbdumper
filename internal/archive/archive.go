@@ -11,7 +11,6 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/JeePeeTee/dbdumper/internal/model"
 )
@@ -102,10 +101,16 @@ type RawEntry struct {
 // matching the CRC and length given, since the header is written from those
 // values rather than derived from the data.
 func (w *Writer) AddRaw(e RawEntry) (io.Writer, error) {
+	// This header carried a Modified time until it turned out never to reach
+	// the file: CreateRaw writes ModifiedTime and ModifiedDate straight out,
+	// and only CreateHeader translates Modified into them. The field was
+	// therefore doing nothing except suggesting that entries were timestamped.
+	// They are not, which is what an archive wants - two exports of an
+	// unchanged database should differ only where the data differs. When the
+	// archive was made is recorded once, in the manifest.
 	return w.zw.CreateRaw(&zip.FileHeader{
 		Name:               e.Name,
 		Method:             zip.Deflate,
-		Modified:           time.Now(),
 		CRC32:              e.CRC32,
 		UncompressedSize64: e.UncompressedSize,
 		CompressedSize64:   e.CompressedSize,
