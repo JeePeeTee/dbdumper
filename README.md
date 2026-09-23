@@ -586,7 +586,7 @@ seconds with bulk copy and about 11 minutes with `--no-bulk`.
 | Schemas | `CREATE SCHEMA`, owner recorded |
 | Tables | columns, types, collations, nullability, identity seed/increment, sparse, `ROWGUIDCOL`, computed columns (incl. `PERSISTED`) |
 | Constraints | primary keys, unique constraints, defaults (named), check constraints, foreign keys with `ON DELETE`/`ON UPDATE` and trusted/disabled state |
-| Indexes | clustered, non-clustered, unique, filtered, `INCLUDE` columns, `FILLFACTOR`, `PAD_INDEX`, `IGNORE_DUP_KEY`, clustered/non-clustered columnstore |
+| Indexes | clustered, non-clustered, unique, filtered, `INCLUDE` columns, `FILLFACTOR`, `PAD_INDEX`, `IGNORE_DUP_KEY`, clustered/non-clustered columnstore, disabled state |
 | Programmability | views, scalar/inline/table-valued functions, stored procedures, triggers — stored verbatim with their `ANSI_NULLS`/`QUOTED_IDENTIFIER` settings |
 | Sequences | full definition plus the current value |
 | User-defined types | scalar alias types and table types |
@@ -596,7 +596,9 @@ Not captured: database users, roles and permissions; database master keys and da
 credentials; XML and spatial indexes; partition schemes and filegroups (everything lands on
 `PRIMARY`); Always Encrypted keys; temporal-table system versioning; CLR assemblies; full-text
 catalogs; extended properties; constraints declared *inside* a table type (its columns are
-reproduced, its primary key is not). Objects it cannot reproduce are reported as warnings at
+reproduced, its primary key is not); modules created `WITH ENCRYPTION`, whose text the server
+will not give out (they are skipped, along with anything built on them); memory-optimized
+tables, which come back as ordinary disk-based tables with their rows intact. Objects it cannot reproduce are reported as warnings at
 export time rather than silently dropped.
 
 Do not read that list as "a `.bacpac` keeps none of these". It keeps more than this tool does: a
@@ -683,7 +685,9 @@ scalar function — are retried until a full pass makes no further progress. Onl
 remaining error reported. This means module dependency order does not have to be perfect.
 
 In `--data-only` mode the schema already exists, so the loader disables triggers and constraint
-checking for the duration of the load and re-enables them afterwards.
+checking for the duration of the load, and afterwards puts each one back as it found it: what was
+disabled stays disabled, what was trusted is validated again. A constraint the loaded rows break
+is re-enabled untrusted and reported, rather than holding every other constraint on its table off.
 
 ## When not to use this
 

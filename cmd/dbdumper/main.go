@@ -65,6 +65,13 @@ func run() int {
 	}
 
 	if err != nil {
+		var ue usageError
+		switch {
+		case errors.Is(err, flag.ErrHelp):
+			return 0 // the flag package has printed the help
+		case errors.As(err, &ue):
+			return 2 // and here the complaint, with the usage after it
+		}
 		if errors.Is(err, context.Canceled) {
 			fmt.Fprintln(os.Stderr, "\ncancelled")
 			return 130
@@ -99,6 +106,25 @@ Connection flags (both export and import):
 
 Run "dbdumper export -h" or "dbdumper import -h" for the rest.
 `)
+}
+
+// usageError is a command line the flag package rejected. It has already said
+// why, so all that is left is the exit status.
+type usageError struct{ err error }
+
+func (e usageError) Error() string { return e.err.Error() }
+
+// parseFlags parses a subcommand's arguments. The flag sets are built with
+// ContinueOnError rather than ExitOnError because the latter calls os.Exit from
+// inside Parse, which skips run's deferred restoreConsole and leaves the
+// console window switched to UTF-8 after nothing more than a mistyped flag or
+// a -h.
+func parseFlags(fs *flag.FlagSet, args []string) error {
+	err := fs.Parse(args)
+	if err == nil || errors.Is(err, flag.ErrHelp) {
+		return err
+	}
+	return usageError{err}
 }
 
 // connFlags registers the shared connection flags on fs.

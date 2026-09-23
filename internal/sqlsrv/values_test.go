@@ -301,3 +301,30 @@ func TestWithDatabaseKeepsOtherParams(t *testing.T) {
 		t.Errorf("old catalog survived: %q", got)
 	}
 }
+
+// TestDecodeValueGivesDriverParams - a chunk boundary is compared against the
+// column, so it has to reach the server as the column's own kind of value. The
+// encoded form of a binary key is base64 text, which would arrive as nvarchar
+// and make the server compare in collation order instead of byte order.
+func TestDecodeValueGivesDriverParams(t *testing.T) {
+	cases := []struct {
+		col  model.Column
+		in   any
+		want any
+	}{
+		{model.Column{TypeName: "varbinary", MaxLength: 16}, "AH+A/w==", []byte{0x00, 0x7F, 0x80, 0xFF}},
+		{model.Column{TypeName: "bigint"}, int64(9007199254740993), int64(9007199254740993)},
+		{model.Column{TypeName: "uniqueidentifier"}, "704134D0-404A-408F-8FE0-0019758A4154", "704134D0-404A-408F-8FE0-0019758A4154"},
+		{model.Column{TypeName: "nvarchar", MaxLength: 100}, "abc", "abc"},
+	}
+	for _, c := range cases {
+		got, err := NewRowCodec([]model.Column{c.col}).DecodeValue(0, c.in)
+		if err != nil {
+			t.Errorf("%s: %v", c.col.TypeName, err)
+			continue
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: got %#v, want %#v", c.col.TypeName, got, c.want)
+		}
+	}
+}

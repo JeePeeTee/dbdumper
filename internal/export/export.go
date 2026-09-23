@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -308,11 +309,12 @@ func Run(ctx context.Context, db *sql.DB, opts Options) (*Result, error) {
 func openSpool(dbm *model.Database, src model.Source, opts Options) (*spool.Spool, map[string]spool.TableState, error) {
 	dir := spool.DirFor(opts.Out)
 	meta := spool.Meta{
-		Tool:        "dbdumper",
-		StartedAt:   time.Now().UTC(),
-		Server:      src.Server,
-		Database:    src.Database,
-		Fingerprint: fingerprint(src.Database, dbm),
+		Tool:          "dbdumper",
+		StartedAt:     time.Now().UTC(),
+		Server:        src.Server,
+		Database:      src.Database,
+		Fingerprint:   fingerprint(src.Database, dbm),
+		Deterministic: opts.Deterministic,
 	}
 
 	if spool.Exists(dir) && !opts.Restart {
@@ -378,7 +380,7 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 		if len(chunks) == 0 {
 			p := piece{tableIndex: i, pos: i + 1, t: t,
 				estRows: t.EstimatedRows, estBytes: progressBytes(t), schedBytes: t.EstimatedBytes}
-			if st, done := states[strings.ToLower(p.label())]; done {
+			if st, done := states[p.label()]; done {
 				adoptResumed(t, st, res, opts)
 				continue
 			}
@@ -399,7 +401,7 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 				schedBytes: t.EstimatedBytes / int64(len(chunks)),
 			}
 			t.DataFiles[k] = p.entry()
-			if st, done := states[strings.ToLower(p.label())]; done {
+			if st, done := states[p.label()]; done {
 				t.RowCount += st.Rows
 				res.Rows += st.Rows
 				res.DataBytes += int64(st.UncompressedSize)
@@ -416,7 +418,7 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 		if resumedChunks == len(chunks) {
 			res.ResumedTables++
 			opts.log("  %-50s %10d rows  %10s (resumed, %d ranges)",
-				t.Schema+"."+t.Name, t.RowCount, humanBytes(resumedBytes), len(chunks))
+				t.Schema+"."+t.Name, t.RowCount, HumanBytes(resumedBytes), len(chunks))
 		}
 	}
 	if len(pieces) == 0 {
@@ -476,7 +478,7 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 					continue
 				}
 				if st.Entry != "" {
-					states[strings.ToLower(p.label())] = st
+					states[p.label()] = st
 					// Chunks of one table share its element, so this is under
 					// the same lock as everything else that touches the model.
 					if p.chunk == nil {
@@ -501,7 +503,7 @@ func adoptResumed(t *model.Table, st spool.TableState, res *Result, opts Options
 	res.DataBytes += int64(st.UncompressedSize)
 	res.ResumedTables++
 	opts.log("  %-50s %10d rows  %10s (resumed)",
-		t.Schema+"."+t.Name, st.Rows, humanBytes(int64(st.UncompressedSize)))
+		t.Schema+"."+t.Name, st.Rows, HumanBytes(int64(st.UncompressedSize)))
 }
 
 // planFor decides how a table is read, reusing an earlier run's division when
@@ -527,7 +529,7 @@ func planFor(ctx context.Context, in *sqlsrv.Introspector, sp *spool.Spool,
 		return nil, sqlsrv.ChunkKey{}
 	}
 
-	planKey := strings.ToLower(t.Schema + "." + t.Name)
+	planKey := t.Schema + "." + t.Name
 	var saved savedPlan
 	if ok, err := sp.LoadPlan(planKey, &saved); err != nil {
 		opts.warn("could not read the chunk plan for %s.%s (%v); reading it in one piece",
@@ -575,15 +577,40 @@ func planFor(ctx context.Context, in *sqlsrv.Introspector, sp *spool.Spool,
 // Spooled data is spliced in already compressed, and each table's spool file is
 // dropped as soon as it is safely inside, so two full copies of the data never
 // exist at once.
+//
+// The archive is built under a temporary name and renamed over the output only
+// once it is complete. Writing it in place truncated whatever was there first,
+// so a failure while packaging destroyed the archive --force was replacing and
+// left a torn one in its place - which then also blocked the --resume that
+// could have recovered.
 func packageArchive(sp *spool.Spool, states map[string]spool.TableState,
 	dbm *model.Database, src model.Source, opts Options) error {
 
 	opts.log("packaging %s...", opts.Out)
-	w, err := archive.Create(opts.Out)
+	tmp := opts.Out + ".tmp"
+	w, err := archive.Create(tmp)
 	if err != nil {
 		return err
 	}
-	defer w.Close()
+	if err := writeArchive(w, sp, states, dbm, src, opts); err != nil {
+		w.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := w.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, opts.Out); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("move the finished archive into place: %w", err)
+	}
+	return nil
+}
+
+// writeArchive fills an open archive: the data, the DDL scripts, the manifest.
+func writeArchive(w *archive.Writer, sp *spool.Spool, states map[string]spool.TableState,
+	dbm *model.Database, src model.Source, opts Options) error {
 
 	for i := range dbm.Tables {
 		t := &dbm.Tables[i]
@@ -591,7 +618,7 @@ func packageArchive(sp *spool.Spool, states map[string]spool.TableState,
 		// directory happens to hold: a table excluded or emptied by this run
 		// may still have data spooled by an earlier one.
 		for _, entry := range t.DataEntries() {
-			st, ok := states[strings.ToLower(entryLabel(t, entry))]
+			st, ok := states[entryLabel(t, entry)]
 			if !ok {
 				return fmt.Errorf("package %s.%s: no spooled data for %s", t.Schema, t.Name, entry)
 			}
@@ -622,10 +649,7 @@ func packageArchive(sp *spool.Spool, states map[string]spool.TableState,
 	if err := w.AddJSON(archive.ManifestName, manifest); err != nil {
 		return err
 	}
-	if err := w.AddText("README.txt", readme); err != nil {
-		return err
-	}
-	return w.Close()
+	return w.AddText("README.txt", readme)
 }
 
 // entryLabel recovers the spool identity that produced an archive entry.
@@ -774,7 +798,7 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, pc piece,
 	codec := sqlsrv.NewRowCodec(cols)
 
 	entry := pc.entry()
-	tw, err := sp.NewTable(strings.ToLower(pc.label()), entry)
+	tw, err := sp.NewTable(pc.label(), entry)
 	if err != nil {
 		return none, err
 	}
@@ -882,7 +906,7 @@ func dumpTable(ctx context.Context, db *sql.DB, sp *spool.Spool, pc piece,
 	if t.RowFilter != "" {
 		suffix = " (filtered)"
 	}
-	opts.log("  %-50s %10d rows  %10s%s", pc.label(), n, humanBytes(cw.n), suffix)
+	opts.log("  %-50s %10d rows  %10s%s", pc.label(), n, HumanBytes(cw.n), suffix)
 	return st, nil
 }
 
@@ -900,7 +924,8 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func humanBytes(n int64) string {
+// HumanBytes renders a byte count in binary units, e.g. "1.5 MB".
+func HumanBytes(n int64) string {
 	const unit = 1024
 	if n < unit {
 		return fmt.Sprintf("%d B", n)

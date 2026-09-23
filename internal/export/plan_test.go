@@ -1,6 +1,7 @@
 package export
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/JeePeeTee/dbdumper/internal/model"
@@ -47,6 +48,15 @@ func TestSavedPlanRoundTrip(t *testing.T) {
 			lo:   "-1234567890123456789012345678.1234567890",
 			hi:   "12345678901234.5678",
 		},
+		{
+			// Bytes in, bytes out. A base64 string coming back would reach the
+			// server as nvarchar, and the resumed ranges would follow a collation
+			// rather than the byte order the first run split on.
+			name: "binary",
+			col:  model.Column{Name: "Hash", TypeName: "binary", MaxLength: 16},
+			lo:   []byte{0x00, 0x7F, 0x80, 0xFF},
+			hi:   []byte{0xAB, 0xCD, 0xEF, 0x01},
+		},
 	}
 
 	for _, c := range cases {
@@ -92,6 +102,9 @@ func sameBoundary(got, want any) bool {
 	case int64:
 		g, ok := got.(int64)
 		return ok && g == w
+	case []byte:
+		g, ok := got.([]byte)
+		return ok && bytes.Equal(g, w)
 	default:
 		return got == want
 	}

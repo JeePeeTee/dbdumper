@@ -147,6 +147,42 @@ func TestSchemaDirRemovesDroppedObjects(t *testing.T) {
 	}
 }
 
+// TestSchemaDirSurvivesARenameThatOnlyChangesCase - on Windows, writing
+// dbo.Orders landed in the existing dbo.orders file under its old name, and
+// pruning then deleted that file as stale, leaving the table with no script.
+// Whatever the filesystem, the object must end up under its new name, once.
+func TestSchemaDirSurvivesARenameThatOnlyChangesCase(t *testing.T) {
+	dir := t.TempDir()
+	db := sampleDB()
+	db.Tables[0].Name = "customer"
+	if _, err := writeSchemaDir(dir, db, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	db.Tables[0].Name = "Customer"
+	if _, err := writeSchemaDir(dir, db, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	var tables []string
+	for _, f := range filesUnder(t, dir) {
+		if strings.HasPrefix(f, "tables/") {
+			tables = append(tables, f)
+		}
+	}
+	want := []string{"tables/sales.Customer.sql", "tables/sales.Order.sql"}
+	if strings.Join(tables, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("after renaming:\n got %v\nwant %v", tables, want)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "tables", "sales.Customer.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "[sales].[Customer]") {
+		t.Errorf("the script should describe the renamed table:\n%s", body)
+	}
+}
+
 // TestSchemaDirLeavesForeignFilesAlone - the directory is meant to live in a
 // repository, where it will accumulate things this tool did not write.
 func TestSchemaDirLeavesForeignFilesAlone(t *testing.T) {

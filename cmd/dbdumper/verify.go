@@ -18,11 +18,11 @@ import (
 
 // runVerify compares a restored database against the archive it came from.
 func runVerify(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	conn := connFlags(fs)
 	in := fs.String("in", "", "archive to compare against (required)")
 	quiet := fs.Bool("quiet", false, "only report differences")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if *in == "" {

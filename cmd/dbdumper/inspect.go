@@ -14,10 +14,10 @@ import (
 )
 
 func runInspect(args []string) error {
-	fs := flag.NewFlagSet("inspect", flag.ExitOnError)
+	fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
 	in := fs.String("in", "", "archive to inspect (required)")
 	show := fs.String("show", "", "print an archive entry verbatim, e.g. schema/040_tables.sql")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if *in == "" && fs.NArg() == 1 {

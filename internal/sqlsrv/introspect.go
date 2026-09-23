@@ -267,6 +267,15 @@ ORDER BY s.name, t.name`)
 				t.DataColumns = append(t.DataColumns, c.Name)
 			}
 		}
+		if t.IsMemoryOptimized {
+			// Recreating one faithfully needs a MEMORY_OPTIMIZED_DATA
+			// filegroup on the target, its durability, and its hash indexes
+			// declared inline - none of which is captured. The rows survive,
+			// but the table does not come back as what it was, and that must
+			// not pass unremarked.
+			in.warn("%s.%s is memory-optimized; it will be restored as an ordinary disk-based table",
+				t.Schema, t.Name)
+		}
 	}
 
 	if err := in.loadRowEstimates(ctx, tables); err != nil {
@@ -301,13 +310,15 @@ GROUP BY s.name, t.name`)
 		if err := rows.Scan(&schema, &name, &e.rows, &e.bytes); err != nil {
 			return err
 		}
-		est[strings.ToLower(schema+"."+name)] = e
+		// Exact names: both sides come from the catalog, and in a case-sensitive
+		// database dbo.Order and dbo.order are two tables with two sizes.
+		est[schema+"."+name] = e
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	for i := range tables {
-		e := est[strings.ToLower(tables[i].Schema+"."+tables[i].Name)]
+		e := est[tables[i].Schema+"."+tables[i].Name]
 		tables[i].EstimatedRows, tables[i].EstimatedBytes = e.rows, e.bytes
 	}
 	return nil
@@ -564,12 +575,16 @@ ORDER BY o.type, s.name, o.name`)
 	defer rows.Close()
 
 	var out []model.Module
+	// Modules this dump cannot carry, keyed like the dependency graph, so that
+	// whatever is built on them is dropped too.
+	missing := map[string]bool{}
 	for rows.Next() {
 		var m model.Module
 		var typ string
 		var principalID int64
 		var parentSchema, parentTable string
-		if err := rows.Scan(&m.Schema, &m.Name, &typ, &m.Definition, &m.AnsiNulls, &m.QuotedIdentifier,
+		var definition sql.NullString
+		if err := rows.Scan(&m.Schema, &m.Name, &typ, &definition, &m.AnsiNulls, &m.QuotedIdentifier,
 			&m.IsSchemaBound, &principalID, &parentSchema, &parentTable,
 			&m.IsDisabled, &m.IsInsteadOfTrigger); err != nil {
 			return nil, err
@@ -588,69 +603,85 @@ ORDER BY o.type, s.name, o.name`)
 		if m.Kind == model.ModuleTrigger && !in.keep(parentSchema, parentTable) {
 			continue
 		}
-		m.Definition = strings.TrimRight(m.Definition, " \t\r\n")
+		if !definition.Valid {
+			// WITH ENCRYPTION: the server keeps the text from everyone, so
+			// there is nothing to recreate the object from. One such object
+			// used to fail the whole export on the NULL.
+			in.warn("skipping %s %s.%s: it was created WITH ENCRYPTION, so its definition cannot be read",
+				m.Kind, m.Schema, m.Name)
+			missing[strings.ToLower(m.Schema+"."+m.Name)] = true
+			continue
+		}
+		m.Definition = strings.TrimRight(definition.String, " \t\r\n")
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	if len(out) == 0 {
+		return out, nil
+	}
 
-	out, err = in.pruneModulesReferencingExcluded(ctx, out)
+	// One read of the graph serves both the pruning and the ordering.
+	deps, err := moduleDependencies(ctx, in.DB)
+	if err != nil {
+		// Without the graph the safe choice is to keep everything and let the
+		// importer's retry-then-report handle the fallout.
+		in.warn("could not read module dependencies (%v); modules are created in catalog order and retried, and any that reference an object missing from this dump will fail on restore", err)
+		return out, nil
+	}
+
+	out, err = in.pruneModulesReferencingMissing(ctx, out, missing, deps)
 	if err != nil {
 		return nil, err
 	}
-
-	if err := orderModulesByDependency(ctx, in.DB, out); err != nil {
-		in.warn("could not resolve module dependencies (%v); falling back to retry ordering", err)
-	}
+	orderModulesByDependency(out, deps)
 	return out, nil
 }
 
-// pruneModulesReferencingExcluded drops views, functions and procedures that
-// depend on a table --include or --exclude left out of the dump.
+// pruneModulesReferencingMissing drops views, functions and procedures that
+// depend on something this dump does not hold: a table --include or --exclude
+// left out, or a module that could not be read.
 //
 // Keeping them produces an archive that cannot be restored: CREATE VIEW fails
 // with "Invalid object name" and the import aborts. Removal is transitive,
 // since a view built on a dropped view is equally unusable.
-func (in *Introspector) pruneModulesReferencingExcluded(ctx context.Context, mods []model.Module) ([]model.Module, error) {
-	if in.Filter == nil || len(mods) == 0 {
-		return mods, nil
+func (in *Introspector) pruneModulesReferencingMissing(ctx context.Context, mods []model.Module,
+	missing map[string]bool, deps map[string][]string) ([]model.Module, error) {
+
+	excluded := make(map[string]bool, len(missing))
+	for k := range missing {
+		excluded[k] = true
 	}
 
-	// Which tables the filter left out. Anything not a table in this database
-	// - a system view, a type - is not our concern and must not trigger a drop.
-	rows, err := in.DB.QueryContext(ctx, `
+	if in.Filter != nil {
+		// Which tables the filter left out. Anything not a table in this
+		// database - a system view, a type - is not our concern and must not
+		// trigger a drop.
+		rows, err := in.DB.QueryContext(ctx, `
 SELECT s.name, t.name
 FROM sys.tables t
 JOIN sys.schemas s ON s.schema_id = t.schema_id
 WHERE t.is_ms_shipped = 0 AND t.type = 'U'`)
-	if err != nil {
-		return nil, fmt.Errorf("read table list for module pruning: %w", err)
-	}
-	excluded := map[string]bool{}
-	for rows.Next() {
-		var schema, name string
-		if err := rows.Scan(&schema, &name); err != nil {
-			rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read table list for module pruning: %w", err)
+		}
+		for rows.Next() {
+			var schema, name string
+			if err := rows.Scan(&schema, &name); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if !in.keep(schema, name) {
+				excluded[strings.ToLower(schema+"."+name)] = true
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
 			return nil, err
 		}
-		if !in.keep(schema, name) {
-			excluded[strings.ToLower(schema+"."+name)] = true
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 	if len(excluded) == 0 {
-		return mods, nil
-	}
-
-	deps, err := moduleDependencies(ctx, in.DB)
-	if err != nil {
-		// Without the dependency graph the safe choice is to keep everything
-		// and let the importer's retry-then-report handle the fallout.
-		in.warn("could not read module dependencies (%v); modules referencing excluded tables may fail on restore", err)
 		return mods, nil
 	}
 
@@ -689,13 +720,28 @@ WHERE t.is_ms_shipped = 0 AND t.type = 'U'`)
 
 // moduleDependencies maps each module to the lower-cased "schema.name" of every
 // entity it references.
+//
+// Where the server has bound a reference to an object, that object's own
+// schema is used. The name as written is only the fallback: a view in schema
+// rpt that says just "Orders" means dbo.Orders when that is what it resolved
+// to, and guessing rpt.Orders from the view's own schema missed the dependency
+// entirely - keeping a view whose table was excluded, and ordering it wrongly.
+//
+// Rows come back in a fixed order so that ties in the ordering built on them
+// fall the same way on every run; --deterministic depends on it.
 func moduleDependencies(ctx context.Context, db *sql.DB) (map[string][]string, error) {
 	rows, err := db.QueryContext(ctx, `
-SELECT DISTINCT ss.name, so.name, ISNULL(d.referenced_schema_name, ss.name), d.referenced_entity_name
+SELECT DISTINCT ss.name, so.name,
+       COALESCE(rs.name, d.referenced_schema_name, ss.name),
+       COALESCE(ro.name, d.referenced_entity_name)
 FROM sys.sql_expression_dependencies d
 JOIN sys.objects so ON so.object_id = d.referencing_id
 JOIN sys.schemas ss ON ss.schema_id = so.schema_id
-WHERE d.referenced_entity_name IS NOT NULL AND d.is_ambiguous = 0`)
+LEFT JOIN sys.objects ro ON ro.object_id = d.referenced_id
+ AND d.referenced_class = 1 AND d.referenced_database_name IS NULL
+LEFT JOIN sys.schemas rs ON rs.schema_id = ro.schema_id
+WHERE d.referenced_entity_name IS NOT NULL AND d.is_ambiguous = 0
+ORDER BY 1, 2, 3, 4`)
 	if err != nil {
 		return nil, err
 	}
@@ -716,41 +762,23 @@ WHERE d.referenced_entity_name IS NOT NULL AND d.is_ambiguous = 0`)
 // orderModulesByDependency topologically sorts modules so that a view or
 // function is created after everything it references. Cycles and unresolvable
 // entries keep their original relative order; the importer retries anything
-// that still fails.
-func orderModulesByDependency(ctx context.Context, db *sql.DB, mods []model.Module) error {
+// that still fails. graph is what moduleDependencies returned.
+func orderModulesByDependency(mods []model.Module, graph map[string][]string) {
 	if len(mods) == 0 {
-		return nil
+		return
 	}
 	index := make(map[string]int, len(mods))
 	for i, m := range mods {
 		index[strings.ToLower(m.Schema+"."+m.Name)] = i
 	}
 
-	rows, err := db.QueryContext(ctx, `
-SELECT DISTINCT ss.name, so.name, ISNULL(d.referenced_schema_name, ss.name), d.referenced_entity_name
-FROM sys.sql_expression_dependencies d
-JOIN sys.objects so ON so.object_id = d.referencing_id
-JOIN sys.schemas ss ON ss.schema_id = so.schema_id
-WHERE d.referenced_entity_name IS NOT NULL AND d.is_ambiguous = 0`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
 	deps := make([][]int, len(mods))
-	for rows.Next() {
-		var fromSchema, fromName, toSchema, toName string
-		if err := rows.Scan(&fromSchema, &fromName, &toSchema, &toName); err != nil {
-			return err
+	for from, m := range mods {
+		for _, ref := range graph[strings.ToLower(m.Schema+"."+m.Name)] {
+			if to, ok := index[ref]; ok && to != from {
+				deps[from] = append(deps[from], to)
+			}
 		}
-		from, ok1 := index[strings.ToLower(fromSchema+"."+fromName)]
-		to, ok2 := index[strings.ToLower(toSchema+"."+toName)]
-		if ok1 && ok2 && from != to {
-			deps[from] = append(deps[from], to)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
 	}
 
 	// Kahn's algorithm over "must be created before" edges, with the original
@@ -801,7 +829,6 @@ WHERE d.referenced_entity_name IS NOT NULL AND d.is_ambiguous = 0`)
 		sorted[i] = mods[idx]
 	}
 	copy(mods, sorted)
-	return nil
 }
 
 func sortByPreference(mods []model.Module, idx []int) {

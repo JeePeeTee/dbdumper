@@ -13,7 +13,7 @@ import (
 )
 
 func runExport(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("export", flag.ExitOnError)
+	fs := flag.NewFlagSet("export", flag.ContinueOnError)
 	conn := connFlags(fs)
 
 	out := fs.String("out", "", "archive to write (required)")
@@ -34,7 +34,7 @@ func runExport(ctx context.Context, args []string) error {
 	fs.Var(&excludeData, "exclude-data", "keep these tables' definitions but skip their rows; repeatable")
 	fs.Var(&where, "where", "restrict a table's rows: <table-glob>:<T-SQL predicate>; repeatable")
 
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if *out == "" {
@@ -99,20 +99,7 @@ func runExport(ctx context.Context, args []string) error {
 		size = fi.Size()
 	}
 	logf("\nwrote %s (%s archive, %s of data) - %d tables, %d rows in %s",
-		*out, humanBytes(size), humanBytes(res.DataBytes),
+		*out, export.HumanBytes(size), export.HumanBytes(res.DataBytes),
 		res.Tables, res.Rows, res.Duration.Round(1e6))
 	return nil
-}
-
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }

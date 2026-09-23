@@ -35,11 +35,43 @@ func writeSchemaDir(dir string, dbm *model.Database, opts Options) (SchemaDirRes
 
 	scripts := plan.ObjectScripts(dbm)
 	wanted := make(map[string]bool, len(scripts))
+	folded := make(map[string]string, len(scripts))
+	for _, s := range scripts {
+		rel := filepath.ToSlash(objectPath(s))
+		wanted[rel] = true
+		// On a case-insensitive filesystem - Windows, macOS by default - these
+		// two would be one file, and whichever is written last wins.
+		if other, ok := folded[strings.ToLower(rel)]; ok {
+			opts.warn("%s and %s differ only in case; on a case-insensitive filesystem one overwrites the other", other, rel)
+		}
+		folded[strings.ToLower(rel)] = rel
+	}
+
+	// Files already present whose name differs from the one this run wants
+	// only in case: what an object renamed from dbo.orders to dbo.Orders leaves
+	// behind. On a case-insensitive filesystem writing the new name would land
+	// in the old file and keep its old name, which pruning - comparing names
+	// exactly - would then delete, taking the object's only script with it.
+	// Removing the old one first lets the write create the file afresh under
+	// the name it should have.
+	present, err := listScripts(dir)
+	if err != nil {
+		return res, err
+	}
+	for _, rel := range present {
+		if wanted[rel] {
+			continue
+		}
+		if _, renamed := folded[strings.ToLower(rel)]; !renamed {
+			continue // simply stale; pruning deals with it
+		}
+		if err := os.Remove(filepath.Join(dir, filepath.FromSlash(rel))); err != nil {
+			return res, fmt.Errorf("remove %s: %w", rel, err)
+		}
+	}
 
 	for _, s := range scripts {
 		rel := objectPath(s)
-		wanted[filepath.ToSlash(rel)] = true
-
 		path := filepath.Join(dir, rel)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return res, err
@@ -76,27 +108,16 @@ func objectPath(s plan.ObjectScript) string {
 // pruneSchemaDir removes .sql files under the directories plan owns that this
 // run did not write.
 func pruneSchemaDir(dir string, wanted map[string]bool, opts Options) (int, error) {
+	present, err := listScripts(dir)
+	if err != nil {
+		return 0, err
+	}
 	var stale []string
-	for _, kind := range plan.ObjectDirs() {
-		sub := filepath.Join(dir, kind)
-		entries, err := os.ReadDir(sub)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			return 0, err
-		}
-		for _, e := range entries {
-			if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".sql") {
-				continue
-			}
-			rel := filepath.ToSlash(filepath.Join(kind, e.Name()))
-			if !wanted[rel] {
-				stale = append(stale, rel)
-			}
+	for _, rel := range present {
+		if !wanted[rel] {
+			stale = append(stale, rel)
 		}
 	}
-	sort.Strings(stale)
 
 	for _, rel := range stale {
 		if err := os.Remove(filepath.Join(dir, filepath.FromSlash(rel))); err != nil {
@@ -105,4 +126,27 @@ func pruneSchemaDir(dir string, wanted map[string]bool, opts Options) (int, erro
 		opts.log("  removed %s", rel)
 	}
 	return len(stale), nil
+}
+
+// listScripts lists the .sql files under the directories plan owns, as
+// slash-separated paths relative to dir, sorted.
+func listScripts(dir string) ([]string, error) {
+	var out []string
+	for _, kind := range plan.ObjectDirs() {
+		entries, err := os.ReadDir(filepath.Join(dir, kind))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ".sql") {
+				continue
+			}
+			out = append(out, filepath.ToSlash(filepath.Join(kind, e.Name())))
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }

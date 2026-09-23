@@ -1,8 +1,6 @@
 package export
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 
 	"github.com/JeePeeTee/dbdumper/internal/model"
@@ -48,28 +46,9 @@ func newSavedPlan(key sqlsrv.ChunkKey, chunks []sqlsrv.Chunk) savedPlan {
 // values a query parameter needs.
 func (p savedPlan) chunks(key sqlsrv.ChunkKey) ([]sqlsrv.Chunk, error) {
 	codec := sqlsrv.NewRowCodec([]model.Column{key.Column})
-	decode := func(v any) (any, error) {
-		// Round-trip through the decoder the same way a row value would, so a
-		// number keeps its precision and a GUID or timestamp keeps its type.
-		raw, err := json.Marshal([]any{v})
-		if err != nil {
-			return nil, err
-		}
-		dec := json.NewDecoder(bytes.NewReader(raw))
-		dec.UseNumber()
-		var row []any
-		if err := dec.Decode(&row); err != nil {
-			return nil, err
-		}
-		out, err := codec.Decode(row, nil)
-		if err != nil {
-			return nil, err
-		}
-		if len(out) != 1 {
-			return nil, fmt.Errorf("decoded %d values, want 1", len(out))
-		}
-		return out[0], nil
-	}
+	// The same route PlanChunks takes, so a resumed run compares with exactly
+	// the parameters the first run did.
+	decode := func(v any) (any, error) { return codec.DecodeValue(0, v) }
 
 	chunks := make([]sqlsrv.Chunk, 0, len(p.Ranges))
 	for _, r := range p.Ranges {

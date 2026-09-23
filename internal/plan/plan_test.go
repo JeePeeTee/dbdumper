@@ -150,3 +150,45 @@ func TestPartialData(t *testing.T) {
 		}
 	}
 }
+
+// TestDisabledIndexIsCreatedBeforeTheDataAndDisabled - a disabled index built
+// after the load, as enabled ones are, came back enabled; and a disabled unique
+// index over rows that no longer satisfy it failed to build at all, aborting
+// the restore. It has to be made on the empty table and switched off there.
+func TestDisabledIndexIsCreatedBeforeTheDataAndDisabled(t *testing.T) {
+	tbl := model.Table{Schema: "dbo", Name: "Orders", Indexes: []model.Index{
+		{Name: "IX_Live", TypeDes: "NONCLUSTERED", Columns: []model.IndexColumn{{Name: "A"}}},
+		{Name: "UX_Off", TypeDes: "NONCLUSTERED", IsUnique: true, IsDisabled: true,
+			Columns: []model.IndexColumn{{Name: "B"}}},
+	}}
+	db := &model.Database{Tables: []model.Table{tbl}}
+
+	var pre, post string
+	for _, s := range tables(db) {
+		pre += s.SQL + "\n"
+	}
+	for _, s := range indexes(db) {
+		post += s.SQL + "\n"
+	}
+
+	if !strings.Contains(pre, "CREATE UNIQUE NONCLUSTERED INDEX [UX_Off]") ||
+		!strings.Contains(pre, "ALTER INDEX [UX_Off] ON [dbo].[Orders] DISABLE") {
+		t.Errorf("the disabled index should be created and disabled with its table:\n%s", pre)
+	}
+	if strings.Index(pre, "CREATE TABLE") > strings.Index(pre, "[UX_Off]") {
+		t.Errorf("the disabled index must follow its table:\n%s", pre)
+	}
+	if strings.Contains(post, "UX_Off") {
+		t.Errorf("the disabled index must not be built again after the data:\n%s", post)
+	}
+	if !strings.Contains(post, "[IX_Live]") || strings.Contains(pre, "IX_Live") {
+		t.Errorf("an enabled index still belongs after the data:\npre:\n%s\npost:\n%s", pre, post)
+	}
+
+	// The per-object script says the same.
+	for _, s := range ObjectScripts(db) {
+		if s.Kind == "tables" && !strings.Contains(s.SQL, "ALTER INDEX [UX_Off] ON [dbo].[Orders] DISABLE;\n") {
+			t.Errorf("the table script should record the index as disabled:\n%s", s.SQL)
+		}
+	}
+}

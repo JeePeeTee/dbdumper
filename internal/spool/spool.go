@@ -32,7 +32,13 @@ import (
 // 2: spool files are named after the piece they hold rather than by position.
 // A version 1 directory cannot be resumed, because its names mean something
 // else and adopting them would mix two numbering schemes in one directory.
-const FormatVersion = 2
+//
+// 3: identities keep their case, so tables differing only in case no longer
+// share a file; binary chunk boundaries compare as bytes rather than as text;
+// and the directory records whether the run was --deterministic. A version 2
+// directory may hold ranges split on the old text ordering, and resuming it
+// would read the rest on byte order, dropping or repeating rows in between.
+const FormatVersion = 3
 
 // Meta identifies the export a work directory belongs to.
 type Meta struct {
@@ -45,12 +51,18 @@ type Meta struct {
 	// resume against a database whose shape has changed, or under a different
 	// --where, would mix rows selected two different ways, so it is refused.
 	Fingerprint string `json:"fingerprint"`
+	// Deterministic records whether rows were read in key order. Tables spooled
+	// one way must not be packaged with tables read the other: an archive
+	// claiming to be reproducible would hold tables in arbitrary order.
+	Deterministic bool `json:"deterministic"`
 }
 
 // TableState is what packaging needs to turn a spooled table into a zip entry.
 type TableState struct {
-	// Identity is "schema.table", lower-cased; it is how a resume recognises
-	// work already done, independent of the order tables are visited in.
+	// Identity is "schema.table", or "schema.table#n" for one range of a split
+	// table, exactly as the catalog spells it; it is how a resume recognises
+	// work already done, independent of the order tables are visited in. Case
+	// is kept: a case-sensitive database can hold both dbo.Order and dbo.order.
 	Identity string `json:"identity"`
 	// Entry is the name the rows will have inside the archive.
 	Entry string `json:"entry"`
@@ -116,6 +128,13 @@ func Resume(dir string, want Meta) (*Spool, error) {
 	case have.Fingerprint != want.Fingerprint:
 		return nil, fmt.Errorf("%q no longer matches the interrupted export in %s: its schema has changed, or the --where filters differ from the ones that run used; use --restart",
 			want.Database, dir)
+	case have.Deterministic != want.Deterministic:
+		how := "without"
+		if have.Deterministic {
+			how = "with"
+		}
+		return nil, fmt.Errorf("the interrupted export in %s was started %s --deterministic; resume it with the same setting, or use --restart",
+			dir, how)
 	}
 	return &Spool{dir: dir}, nil
 }
@@ -190,8 +209,12 @@ func (s *Spool) planPath(identity string) string {
 //
 // The digest is truncated to 64 bits, which over any realistic number of tables
 // is far below the chance of the disk lying about the write.
+//
+// The identity is hashed as it is, not case-folded: in a case-sensitive
+// database two tables can differ only in case, and folding them together would
+// have both written into one file at once.
 func fileBase(identity string) string {
-	sum := sha256.Sum256([]byte(strings.ToLower(identity)))
+	sum := sha256.Sum256([]byte(identity))
 	return hex.EncodeToString(sum[:8])
 }
 

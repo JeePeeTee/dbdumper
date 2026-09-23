@@ -76,9 +76,7 @@ func schemas(db *model.Database) []Stmt {
 		}
 		out = append(out, Stmt{
 			Describe: "schema " + s.Name,
-			SQL: fmt.Sprintf("IF SCHEMA_ID(%s) IS NULL EXEC(%s)",
-				model.QuoteString(s.Name),
-				model.QuoteString("CREATE SCHEMA "+model.Quote(s.Name))),
+			SQL:      schemaSQL(s),
 		})
 	}
 	return out
@@ -116,6 +114,22 @@ func tables(db *model.Database) []Stmt {
 			SQL:       t.CreateDDL(),
 			Retryable: hasComputed(t),
 		})
+		// A disabled index is created here, while the table is still empty,
+		// and disabled at once. Building it after the load, as the enabled
+		// ones are, would build what the source had switched off - and a
+		// unique index is often switched off precisely because the rows no
+		// longer satisfy it, so the build would fail and abort the restore.
+		// Disabled, it is not maintained while the rows go in.
+		for _, ix := range t.Indexes {
+			if !ix.IsDisabled {
+				continue
+			}
+			out = append(out, Stmt{
+				Describe:  fmt.Sprintf("disabled index %s on %s.%s", ix.Name, t.Schema, t.Name),
+				SQL:       indexSQL(t, ix),
+				Retryable: hasComputed(t), // follows its table if that is deferred
+			})
+		}
 	}
 	return out
 }
@@ -133,9 +147,12 @@ func indexes(db *model.Database) []Stmt {
 	var out []Stmt
 	for _, t := range db.Tables {
 		for _, ix := range t.Indexes {
+			if ix.IsDisabled {
+				continue // created with its table; see tables
+			}
 			out = append(out, Stmt{
 				Describe: fmt.Sprintf("index %s on %s.%s", ix.Name, t.Schema, t.Name),
-				SQL:      ix.CreateIndexDDL(t),
+				SQL:      indexSQL(t, ix),
 			})
 		}
 	}
@@ -146,27 +163,25 @@ func checks(db *model.Database) []Stmt {
 	var out []Stmt
 	for _, t := range db.Tables {
 		for _, cc := range t.CheckConstraints {
-			s := Stmt{
+			out = append(out, Stmt{
 				Describe:  fmt.Sprintf("check %s on %s.%s", cc.Name, t.Schema, t.Name),
-				SQL:       cc.AddDDL(t),
+				SQL:       checkSQL(t, cc),
 				Retryable: true, // may reference a not-yet-created function
-			}
-			if cc.IsDisabled {
-				s.SQL += ";\nALTER TABLE " + t.QualifiedName() + " NOCHECK CONSTRAINT " + model.Quote(cc.Name)
-			}
-			out = append(out, s)
+			})
 		}
 	}
 	return out
 }
 
 // partialTables is the set of tables that will not hold all of their rows,
-// keyed by lower-cased qualified name.
+// keyed by "schema.table" exactly as the catalog spells it. A foreign key names
+// its target the same way, and folding case would, in a case-sensitive
+// database, mark dbo.order partial because dbo.Order is.
 func partialTables(db *model.Database) map[string]bool {
 	out := map[string]bool{}
 	for _, t := range db.Tables {
 		if t.PartialData() {
-			out[strings.ToLower(t.Schema+"."+t.Name)] = true
+			out[t.Schema+"."+t.Name] = true
 		}
 	}
 	return out
@@ -193,7 +208,7 @@ func UntrustedForeignKeys(db *model.Database) []string {
 			continue
 		}
 		for _, fk := range t.ForeignKeys {
-			if partial[strings.ToLower(fk.ReferencedSchema+"."+fk.ReferencedTable)] {
+			if partial[fk.ReferencedSchema+"."+fk.ReferencedTable] {
 				out = append(out, fmt.Sprintf("%s on %s.%s -> %s.%s",
 					fk.Name, t.Schema, t.Name, fk.ReferencedSchema, fk.ReferencedTable))
 			}
@@ -203,25 +218,15 @@ func UntrustedForeignKeys(db *model.Database) []string {
 }
 
 func foreignKeys(db *model.Database) []Stmt {
-	// A table holding only some of its rows - skipped outright, or filtered by
-	// --where - cannot satisfy the foreign keys pointing at it, so those have
-	// to be created unvalidated.
-	skipped := partialTables(db)
+	partial := partialTables(db)
 
 	var out []Stmt
 	for _, t := range db.Tables {
 		for _, fk := range t.ForeignKeys {
-			if skipped[strings.ToLower(fk.ReferencedSchema+"."+fk.ReferencedTable)] {
-				fk.IsNotTrusted = true
-			}
-			s := Stmt{
+			out = append(out, Stmt{
 				Describe: fmt.Sprintf("foreign key %s on %s.%s", fk.Name, t.Schema, t.Name),
-				SQL:      fk.AddDDL(t),
-			}
-			if fk.IsDisabled {
-				s.SQL += ";\nALTER TABLE " + t.QualifiedName() + " NOCHECK CONSTRAINT " + model.Quote(fk.Name)
-			}
-			out = append(out, s)
+				SQL:      foreignKeySQL(t, fk, partial),
+			})
 		}
 	}
 	return out
@@ -230,8 +235,7 @@ func foreignKeys(db *model.Database) []Stmt {
 func modules(db *model.Database) []Stmt {
 	var out []Stmt
 	for _, m := range db.Modules {
-		settings := fmt.Sprintf("SET ANSI_NULLS %s;\nSET QUOTED_IDENTIFIER %s;\n",
-			onOff(m.AnsiNulls), onOff(m.QuotedIdentifier))
+		settings := moduleSettings(m)
 
 		// CREATE must be the first statement in its batch, so the definition is
 		// executed through sp_executesql, which inherits the SET options above.
@@ -248,14 +252,63 @@ func modules(db *model.Database) []Stmt {
 			Retryable: true,
 		}
 		if m.Kind == model.ModuleTrigger && m.IsDisabled {
-			disable := "\nDISABLE TRIGGER " + model.Quote(m.Schema) + "." + model.Quote(m.Name) +
-				" ON " + model.Quote(m.ParentSchema) + "." + model.Quote(m.ParentName) + ";"
+			disable := "\n" + disableTriggerSQL(m) + ";"
 			s.SQL += disable
 			s.Script += disable
 		}
 		out = append(out, s)
 	}
 	return out
+}
+
+// The functions below render one object each. The restore phases above and
+// the per-object scripts in objects.go are both built from them, so what a
+// schema directory records cannot drift from what a restore executes.
+
+func schemaSQL(s model.Schema) string {
+	return fmt.Sprintf("IF SCHEMA_ID(%s) IS NULL EXEC(%s)",
+		model.QuoteString(s.Name), model.QuoteString("CREATE SCHEMA "+model.Quote(s.Name)))
+}
+
+// indexSQL creates an index, and leaves it disabled if the source had it so.
+func indexSQL(t model.Table, ix model.Index) string {
+	s := ix.CreateIndexDDL(t)
+	if ix.IsDisabled {
+		s += ";\n" + ix.DisableDDL(t)
+	}
+	return s
+}
+
+func checkSQL(t model.Table, cc model.CheckConstraint) string {
+	s := cc.AddDDL(t)
+	if cc.IsDisabled {
+		s += ";\nALTER TABLE " + t.QualifiedName() + " NOCHECK CONSTRAINT " + model.Quote(cc.Name)
+	}
+	return s
+}
+
+// foreignKeySQL creates a foreign key. One pointing at a table that holds
+// only some of its rows - skipped outright, or filtered by --where - cannot be
+// satisfied, so it is created unvalidated.
+func foreignKeySQL(t model.Table, fk model.ForeignKey, partial map[string]bool) string {
+	if partial[fk.ReferencedSchema+"."+fk.ReferencedTable] {
+		fk.IsNotTrusted = true
+	}
+	s := fk.AddDDL(t)
+	if fk.IsDisabled {
+		s += ";\nALTER TABLE " + t.QualifiedName() + " NOCHECK CONSTRAINT " + model.Quote(fk.Name)
+	}
+	return s
+}
+
+func moduleSettings(m model.Module) string {
+	return fmt.Sprintf("SET ANSI_NULLS %s;\nSET QUOTED_IDENTIFIER %s;\n",
+		onOff(m.AnsiNulls), onOff(m.QuotedIdentifier))
+}
+
+func disableTriggerSQL(m model.Module) string {
+	return "DISABLE TRIGGER " + model.Quote(m.Schema) + "." + model.Quote(m.Name) +
+		" ON " + model.Quote(m.ParentSchema) + "." + model.Quote(m.ParentName)
 }
 
 func onOff(b bool) string {

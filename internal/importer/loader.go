@@ -24,9 +24,9 @@ type dataHeader struct {
 }
 
 // loadTable loads every entry belonging to a table. A table read in ranges
-// arrives as several entries; they share one pinned connection and one
-// IDENTITY_INSERT scope, so they are loaded one after another rather than
-// opened all at once.
+// arrives as several entries. They are loaded one after another rather than at
+// once: SQL Server allows IDENTITY_INSERT on one table per session, and each
+// entry pins a connection of its own for as long as it holds it on.
 func loadTable(ctx context.Context, db *sql.DB, ar *archive.Reader, t model.Table, opts Options) (int64, error) {
 	var total int64
 	for _, entry := range t.DataEntries() {
@@ -96,6 +96,10 @@ func loadEntry(ctx context.Context, db *sql.DB, ar *archive.Reader, t model.Tabl
 
 // insertRows loads a table with batched multi-row INSERT statements. It is the
 // general path: it handles every type, at roughly a third of bulk copy's speed.
+//
+// The count it returns is of rows committed. On an error the open transaction
+// is rolled back, so rows read since the last commit are not in the table and
+// must not be reported as loaded.
 func insertRows(ctx context.Context, conn *sql.Conn, dec *json.Decoder, codec *sqlsrv.RowCodec,
 	t model.Table, cols []model.Column, opts Options) (int64, error) {
 
@@ -115,11 +119,12 @@ func insertRows(ctx context.Context, conn *sql.Conn, dec *json.Decoder, codec *s
 	// Staged rows live in one flat buffer, so a batch is a contiguous slice of
 	// it and can be passed to Exec without copying or per-row allocation.
 	var (
-		total   int64
-		stage   = make([]any, rowsPerBatch*len(cols))
-		staged  int
-		tx      *sql.Tx
-		sinceTx int
+		total     int64
+		committed int64
+		stage     = make([]any, rowsPerBatch*len(cols))
+		staged    int
+		tx        *sql.Tx
+		sinceTx   int
 	)
 
 	// Almost every batch has exactly rowsPerBatch rows, so the statement for
@@ -190,13 +195,13 @@ func insertRows(ctx context.Context, conn *sql.Conn, dec *json.Decoder, codec *s
 			if err == io.EOF {
 				break
 			}
-			return total, fmt.Errorf("row %d: %w", total+1, err)
+			return committed, fmt.Errorf("row %d: %w", total+1, err)
 		}
 		// Decode straight into this row's slot: a zero-length, exactly-capped
 		// window over the staging buffer, so the appends land in place.
 		lo := staged * len(cols)
 		if _, err := codec.Decode(raw, stage[lo:lo:lo+len(cols)]); err != nil {
-			return total, fmt.Errorf("row %d: %w", total+1, err)
+			return committed, fmt.Errorf("row %d: %w", total+1, err)
 		}
 		staged++
 		total++
@@ -204,28 +209,29 @@ func insertRows(ctx context.Context, conn *sql.Conn, dec *json.Decoder, codec *s
 
 		if staged >= rowsPerBatch {
 			if err := flush(); err != nil {
-				return total, err
+				return committed, err
 			}
 		}
 		if sinceTx >= opts.CommitRows {
 			if err := flush(); err != nil {
-				return total, err
+				return committed, err
 			}
 			if err := commit(); err != nil {
-				return total, err
+				return committed, err
 			}
+			committed = total
 			if err := begin(); err != nil {
-				return total, err
+				return committed, err
 			}
 			opts.log("  %-50s %10d rows...", t.Schema+"."+t.Name, total)
 		}
 	}
 
 	if err := flush(); err != nil {
-		return total, err
+		return committed, err
 	}
 	if err := commit(); err != nil {
-		return total, err
+		return committed, err
 	}
 
 	opts.log("  %-50s %10d rows", t.Schema+"."+t.Name, total)
