@@ -29,7 +29,9 @@ type SchemaDirResult struct {
 //
 // Only files this function could have written are ever removed: inside the
 // directories it owns, ending in .sql. Anything else in the tree - a README, a
-// .gitattributes, a subdirectory someone added - is left alone.
+// .gitattributes, a subdirectory someone added - is left alone. And nothing is
+// removed at all by a run filtered with --include or --exclude, which cannot
+// tell an object it skipped from one that is gone.
 func writeSchemaDir(dir string, dbm *model.Database, opts Options) (SchemaDirResult, error) {
 	var res SchemaDirResult
 
@@ -88,6 +90,15 @@ func writeSchemaDir(dir string, dbm *model.Database, opts Options) (SchemaDirRes
 		res.Written++
 	}
 
+	if len(opts.Include) > 0 || len(opts.Exclude) > 0 {
+		// A filtered run has no opinion about the objects it was told to
+		// ignore, and a table it did not look at is not a table that was
+		// dropped. Pruning here deleted the file of every table outside
+		// --include - and of every view built on one - on the strength of
+		// nothing but a guess.
+		opts.log("  --include/--exclude is in effect, so files of objects outside it are left as they are")
+		return res, nil
+	}
 	removed, err := pruneSchemaDir(dir, wanted, opts)
 	if err != nil {
 		return res, err

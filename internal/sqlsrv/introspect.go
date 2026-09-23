@@ -557,7 +557,7 @@ ORDER BY cc.name`)
 func (in *Introspector) modules(ctx context.Context, tables []model.Table) ([]model.Module, error) {
 	rows, err := in.DB.QueryContext(ctx, `
 SELECT s.name, o.name, o.type, m.definition, m.uses_ansi_nulls, m.uses_quoted_identifier,
-       m.is_schema_bound, ISNULL(m.execute_as_principal_id, -1),
+       m.is_schema_bound,
        ISNULL(ps.name, N''), ISNULL(pt.name, N''),
        ISNULL(tr.is_disabled, 0), ISNULL(tr.is_instead_of_trigger, 0)
 FROM sys.sql_modules m
@@ -581,11 +581,10 @@ ORDER BY o.type, s.name, o.name`)
 	for rows.Next() {
 		var m model.Module
 		var typ string
-		var principalID int64
 		var parentSchema, parentTable string
 		var definition sql.NullString
 		if err := rows.Scan(&m.Schema, &m.Name, &typ, &definition, &m.AnsiNulls, &m.QuotedIdentifier,
-			&m.IsSchemaBound, &principalID, &parentSchema, &parentTable,
+			&m.IsSchemaBound, &parentSchema, &parentTable,
 			&m.IsDisabled, &m.IsInsteadOfTrigger); err != nil {
 			return nil, err
 		}

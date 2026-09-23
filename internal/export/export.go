@@ -446,8 +446,18 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 	go tr.report(opts, len(dbm.Tables), interval, stop)
 	defer close(stop)
 
+	// Workers read the model - dumpTable copies the table it is given - so
+	// none of them may write to it while the others run. The chunks of a split
+	// table share one element, and updating its row count from one worker as
+	// another copied it was a data race. What each piece produced is collected
+	// here instead and applied once every worker has stopped.
+	type finished struct {
+		p  piece
+		st spool.TableState
+	}
 	var (
-		mu       sync.Mutex // guards states, res, the model and firstErr
+		mu       sync.Mutex // guards states, res, done and firstErr
+		done     []finished
 		firstErr error
 		next     int64 = -1
 	)
@@ -479,12 +489,7 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 				}
 				if st.Entry != "" {
 					states[p.label()] = st
-					// Chunks of one table share its element, so this is under
-					// the same lock as everything else that touches the model.
-					if p.chunk == nil {
-						p.t.DataFile = st.Entry
-					}
-					p.t.RowCount += st.Rows
+					done = append(done, finished{p, st})
 					res.Rows += st.Rows
 					res.DataBytes += int64(st.UncompressedSize)
 				}
@@ -493,6 +498,13 @@ func spoolTables(ctx context.Context, db *sql.DB, sp *spool.Spool, states map[st
 		}()
 	}
 	wg.Wait()
+
+	for _, f := range done {
+		if f.p.chunk == nil {
+			f.p.t.DataFile = f.st.Entry
+		}
+		f.p.t.RowCount += f.st.Rows
+	}
 	return firstErr
 }
 
@@ -577,6 +589,12 @@ func planFor(ctx context.Context, in *sqlsrv.Introspector, sp *spool.Spool,
 // Spooled data is spliced in already compressed, and each table's spool file is
 // dropped as soon as it is safely inside, so two full copies of the data never
 // exist at once.
+//
+// The price is paid only when packaging fails: the tables already copied are
+// gone from the work directory, and a --resume reads them from the database
+// again. That is deliberate (issue #30). It costs time, never data, and the
+// likeliest cause of such a failure is a full disk - which keeping the spool
+// until the end, doubling the peak, would make likelier still.
 //
 // The archive is built under a temporary name and renamed over the output only
 // once it is complete. Writing it in place truncated whatever was there first,
