@@ -413,6 +413,10 @@ the folder slowly fills with dead scripts. Deletion is limited to `.sql` files d
 directories listed above — a `README.md`, a `.gitattributes`, or anything in a folder not on that
 list is left alone.
 
+A run filtered with `--include` or `--exclude` deletes nothing. It cannot tell a table it was told
+to skip from one that was dropped, so rather than guess it leaves every file outside its filter as
+it was — an export of three tables updates those three and nothing else.
+
 Unchanged files are not rewritten, so a nightly run over an untouched database leaves every
 timestamp as it was and produces no commit:
 

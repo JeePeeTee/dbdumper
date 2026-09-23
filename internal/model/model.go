@@ -304,7 +304,6 @@ type Module struct {
 	QuotedIdentifier    bool   `json:"quotedIdentifier"`
 	IsDisabled          bool   `json:"isDisabled,omitempty"`
 	IsSchemaBound       bool   `json:"isSchemaBound,omitempty"`
-	ExecuteAsPrincipal  string `json:"executeAsPrincipal,omitempty"`
 	IsInsteadOfTrigger  bool   `json:"isInsteadOfTrigger,omitempty"`
 	OrderHintPreference int    `json:"-"`
 }

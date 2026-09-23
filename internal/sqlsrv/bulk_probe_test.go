@@ -2,15 +2,21 @@ package sqlsrv
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 
 	mssql "github.com/microsoft/go-mssqldb"
 )
 
-// TestBulkCopyKeepsIdentity checks whether go-mssqldb's bulk copy preserves
+// TestBulkCopyKeepsIdentity checks that go-mssqldb's bulk copy preserves
 // explicit identity values when SET IDENTITY_INSERT is on for the session.
-// The driver exposes no KEEPIDENTITY option, so this is the only way to know.
+//
+// The driver exposes no KEEPIDENTITY option, and the importer's bulk path
+// relies on this behaviour for every table with an identity column. It began
+// life as a probe that logged what it saw; it asserts now, because a driver
+// upgrade that renumbered the rows would otherwise break every foreign key in
+// a restore while this test went on passing.
 func TestBulkCopyKeepsIdentity(t *testing.T) {
 	dsn := os.Getenv("DBDUMPER_TEST_DSN")
 	if dsn == "" {
@@ -66,9 +72,7 @@ func TestBulkCopyKeepsIdentity(t *testing.T) {
 		return tx.Commit()
 	}()
 	if err != nil {
-		t.Logf("bulk copy with IDENTITY_INSERT ON failed: %v", err)
-		t.Log("=> bulk copy cannot be used for tables with identity columns")
-		return
+		t.Fatalf("bulk copy with IDENTITY_INSERT ON failed, so the bulk path cannot load tables with an identity column: %v", err)
 	}
 
 	rows, err := conn.QueryContext(ctx, "SELECT Id FROM dbo.dbdumper_bulk_probe ORDER BY Id")
@@ -84,5 +88,10 @@ func TestBulkCopyKeepsIdentity(t *testing.T) {
 		}
 		got = append(got, id)
 	}
-	t.Logf("ids after bulk copy: %v (wanted [100 200 300])", got)
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(got) != "[100 200 300]" {
+		t.Errorf("ids after bulk copy = %v, want [100 200 300]: the explicit identity values were not kept", got)
+	}
 }

@@ -147,6 +147,42 @@ func TestSchemaDirRemovesDroppedObjects(t *testing.T) {
 	}
 }
 
+// TestFilteredSchemaDirDeletesNothing - a run filtered with --include sees
+// only part of the database, and used to delete the file of every table it
+// had not been asked about, as though each had been dropped.
+func TestFilteredSchemaDirDeletesNothing(t *testing.T) {
+	dir := t.TempDir()
+	db := sampleDB()
+	if _, err := writeSchemaDir(dir, db, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	before := filesUnder(t, dir)
+
+	// What an --include of one table hands over: only that table.
+	filtered := sampleDB()
+	filtered.Tables = filtered.Tables[:1]
+	filtered.Modules = nil
+	res, err := writeSchemaDir(dir, filtered, Options{Include: []string{"sales.Customer"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Removed != 0 {
+		t.Errorf("Removed = %d, want 0", res.Removed)
+	}
+	if got := filesUnder(t, dir); strings.Join(got, "\n") != strings.Join(before, "\n") {
+		t.Errorf("a filtered run changed the file set:\n got %v\nwant %v", got, before)
+	}
+
+	// Unfiltered, the same model does mean those objects are gone.
+	res, err = writeSchemaDir(dir, filtered, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Removed == 0 {
+		t.Error("an unfiltered run should still prune")
+	}
+}
+
 // TestSchemaDirSurvivesARenameThatOnlyChangesCase - on Windows, writing
 // dbo.Orders landed in the existing dbo.orders file under its old name, and
 // pruning then deleted that file as stale, leaving the table with no script.
