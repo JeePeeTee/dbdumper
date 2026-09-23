@@ -183,9 +183,18 @@ SELECT MIN(%[1]s) FROM (
 			return nil, err
 		}
 		v := codec.Encode(nil)
-		if len(v) == 1 && v[0] != nil {
-			bounds = append(bounds, v[0])
+		if len(v) != 1 || v[0] == nil {
+			continue
 		}
+		// The parameter a resumed run will compare with, which it decodes from
+		// the saved plan by this same route. Using the encoded form here would
+		// split a binary key on text order now and on byte order after a
+		// resume, and rows would fall between the two.
+		b, err := codec.DecodeValue(0, v[0])
+		if err != nil {
+			return nil, err
+		}
+		bounds = append(bounds, b)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

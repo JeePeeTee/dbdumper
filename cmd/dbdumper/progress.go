@@ -92,7 +92,7 @@ func progressTail(p export.Progress, withBar, withBytes bool) string {
 		fmt.Fprintf(&b, " %s rows", compactCount(p.Rows))
 	}
 	if withBytes {
-		fmt.Fprintf(&b, " %s", humanBytes(p.Bytes))
+		fmt.Fprintf(&b, " %s", export.HumanBytes(p.Bytes))
 	}
 
 	// One ETA, and it is the one worth knowing: when the export finishes, not

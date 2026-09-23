@@ -146,6 +146,36 @@ func TestResumeRefusesAForeignWorkDirectory(t *testing.T) {
 	if _, err := Resume(s.Dir(), changed); err == nil {
 		t.Error("resuming after a schema change should be refused")
 	}
+
+	// Tables already spooled in arbitrary order must not end up in an archive
+	// that claims to be reproducible, nor the other way round.
+	ordered := m
+	ordered.Deterministic = true
+	if _, err := Resume(s.Dir(), ordered); err == nil {
+		t.Error("resuming with --deterministic when the run started without it should be refused")
+	} else if !strings.Contains(err.Error(), "--deterministic") {
+		t.Errorf("the error should name the setting that differs: %v", err)
+	}
+}
+
+// TestIdentitiesDifferingOnlyInCaseAreDistinct - a case-sensitive database can
+// hold dbo.Order and dbo.order side by side. Folding their identities together
+// put both in one spool file, written by two workers at once.
+func TestIdentitiesDifferingOnlyInCaseAreDistinct(t *testing.T) {
+	s, _ := newSpool(t)
+	upper := spoolOne(t, s, "dbo.Order", "data/dbo.Order.jsonl", []byte("upper\n"))
+	lower := spoolOne(t, s, "dbo.order", "data/dbo.order.jsonl", []byte("lower\nlower\n"))
+
+	if upper.File == lower.File {
+		t.Fatalf("both tables were spooled to %s", upper.File)
+	}
+	done, err := s.Completed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done["dbo.Order"].Rows != 1 || done["dbo.order"].Rows != 2 {
+		t.Errorf("each table should keep its own state, got %+v", done)
+	}
 }
 
 // TestFingerprintTracksShapeNotOrder - the fingerprint must survive a different

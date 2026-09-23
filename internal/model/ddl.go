@@ -218,6 +218,11 @@ func (ix Index) CreateIndexDDL(table Table) string {
 	return ix.withOptions(b.String())
 }
 
+// DisableDDL renders the ALTER INDEX statement that disables this index.
+func (ix Index) DisableDDL(table Table) string {
+	return fmt.Sprintf("ALTER INDEX %s ON %s DISABLE", Quote(ix.Name), table.QualifiedName())
+}
+
 // AddDDL renders the ALTER TABLE statement that creates this foreign key.
 func (fk ForeignKey) AddDDL(table Table) string {
 	cols := make([]string, len(fk.Columns))

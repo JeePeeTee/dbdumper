@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -234,36 +233,14 @@ func runPhase(ctx context.Context, db *sql.DB, ph plan.Phase, opts Options, res 
 
 func loadAllData(ctx context.Context, db *sql.DB, ar *archive.Reader, tables []model.Table, opts Options, res *Result) error {
 	// In data-only mode the schema already exists, so constraints and triggers
-	// are live. Quiet them for the duration of the load.
+	// are live. Quiet them for the duration of the load, and put back after it
+	// exactly what was there before.
 	if opts.DataOnly {
-		for _, t := range tables {
-			exec(ctx, db, "ALTER TABLE "+t.QualifiedName()+" NOCHECK CONSTRAINT ALL", opts)
-			exec(ctx, db, "DISABLE TRIGGER ALL ON "+t.QualifiedName(), opts)
+		restore, err := quiesce(ctx, db, tables, opts)
+		if err != nil {
+			return err
 		}
-		defer func() {
-			// Deliberately detached from ctx: on Ctrl+C it is already
-			// cancelled, and re-enabling through it would fail for every
-			// table, leaving the target database with its constraints
-			// unchecked and its triggers off - a state this function created
-			// and must undo whether the load finished or not.
-			restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-			defer cancel()
-
-			var failed []string
-			for _, t := range tables {
-				if !execOK(restoreCtx, db, "ENABLE TRIGGER ALL ON "+t.QualifiedName(), opts) ||
-					!execOK(restoreCtx, db, "ALTER TABLE "+t.QualifiedName()+" WITH CHECK CHECK CONSTRAINT ALL", opts) {
-					failed = append(failed, t.Schema+"."+t.Name)
-				}
-			}
-			if len(failed) > 0 {
-				// Loud, because the database is left in a state the user did
-				// not ask for and cannot see without looking.
-				opts.warn("could not re-enable triggers or constraints on %d table(s): %s",
-					len(failed), strings.Join(failed, ", "))
-				opts.warn("those tables are left with constraints unchecked; re-run the import or fix them by hand")
-			}
-		}()
+		defer restore()
 	}
 
 	// Foreign keys are created after the data, so table load order does not

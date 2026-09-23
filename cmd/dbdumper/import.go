@@ -15,7 +15,7 @@ import (
 )
 
 func runImport(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("import", flag.ExitOnError)
+	fs := flag.NewFlagSet("import", flag.ContinueOnError)
 	conn := connFlags(fs)
 
 	in := fs.String("in", "", "archive to restore (required)")
@@ -33,7 +33,7 @@ func runImport(ctx context.Context, args []string) error {
 	fs.Var(&include, "include", "only these tables; glob on schema.table, repeatable")
 	fs.Var(&exclude, "exclude", "skip these tables; glob on schema.table, repeatable")
 
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if *in == "" {

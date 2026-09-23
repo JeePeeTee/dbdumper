@@ -1,7 +1,6 @@
 package plan
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/JeePeeTee/dbdumper/internal/model"
@@ -38,9 +37,7 @@ func ObjectScripts(db *model.Database) []ObjectScript {
 			continue // always present, never scripted
 		}
 		out = append(out, ObjectScript{
-			Kind: "schemas", Name: s.Name,
-			SQL: fmt.Sprintf("IF SCHEMA_ID(%s) IS NULL EXEC(%s);\n",
-				model.QuoteString(s.Name), model.QuoteString("CREATE SCHEMA "+model.Quote(s.Name))),
+			Kind: "schemas", Name: s.Name, SQL: schemaSQL(s) + ";\n",
 		})
 	}
 
@@ -69,17 +66,13 @@ func ObjectScripts(db *model.Database) []ObjectScript {
 
 		for _, ix := range t.Indexes {
 			b.WriteString("\n")
-			b.WriteString(ix.CreateIndexDDL(t))
+			b.WriteString(indexSQL(t, ix))
 			b.WriteString(";\n")
 		}
 		for _, cc := range t.CheckConstraints {
 			b.WriteString("\n")
-			b.WriteString(cc.AddDDL(t))
+			b.WriteString(checkSQL(t, cc))
 			b.WriteString(";\n")
-			if cc.IsDisabled {
-				fmt.Fprintf(&b, "ALTER TABLE %s NOCHECK CONSTRAINT %s;\n",
-					t.QualifiedName(), model.Quote(cc.Name))
-			}
 		}
 		out = append(out, ObjectScript{
 			Kind: "tables", Schema: t.Schema, Name: t.Name, SQL: b.String(),
@@ -90,15 +83,8 @@ func ObjectScripts(db *model.Database) []ObjectScript {
 		}
 		b.Reset()
 		for _, fk := range t.ForeignKeys {
-			if partial[strings.ToLower(fk.ReferencedSchema+"."+fk.ReferencedTable)] {
-				fk.IsNotTrusted = true
-			}
-			b.WriteString(fk.AddDDL(t))
+			b.WriteString(foreignKeySQL(t, fk, partial))
 			b.WriteString(";\n")
-			if fk.IsDisabled {
-				fmt.Fprintf(&b, "ALTER TABLE %s NOCHECK CONSTRAINT %s;\n",
-					t.QualifiedName(), model.Quote(fk.Name))
-			}
 		}
 		out = append(out, ObjectScript{
 			Kind: "foreignkeys", Schema: t.Schema, Name: t.Name, SQL: b.String(),
@@ -107,16 +93,14 @@ func ObjectScripts(db *model.Database) []ObjectScript {
 
 	for _, m := range db.Modules {
 		var b strings.Builder
-		fmt.Fprintf(&b, "SET ANSI_NULLS %s;\nSET QUOTED_IDENTIFIER %s;\nGO\n",
-			onOff(m.AnsiNulls), onOff(m.QuotedIdentifier))
+		b.WriteString(moduleSettings(m))
+		b.WriteString("GO\n")
 		b.WriteString(m.Definition)
 		if !strings.HasSuffix(m.Definition, "\n") {
 			b.WriteString("\n")
 		}
 		if m.Kind == model.ModuleTrigger && m.IsDisabled {
-			fmt.Fprintf(&b, "GO\nDISABLE TRIGGER %s.%s ON %s.%s;\n",
-				model.Quote(m.Schema), model.Quote(m.Name),
-				model.Quote(m.ParentSchema), model.Quote(m.ParentName))
+			b.WriteString("GO\n" + disableTriggerSQL(m) + ";\n")
 		}
 		out = append(out, ObjectScript{
 			Kind: moduleDir(m.Kind), Schema: m.Schema, Name: m.Name, SQL: b.String(),

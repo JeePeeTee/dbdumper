@@ -1,6 +1,7 @@
 package sqlsrv
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -229,6 +230,29 @@ func (rc *RowCodec) Decode(row []any, out []any) ([]any, error) {
 		out = append(out, v)
 	}
 	return out, nil
+}
+
+// DecodeValue turns one value as Encode produced it into the parameter the
+// driver needs for column i, by the route a value read back from the archive
+// takes: through JSON, then Decode.
+//
+// Anything that compares a column against a value it once encoded must go
+// through here rather than use the encoded form directly. The two differ for
+// the binary types, whose encoded form is base64 text: passed as-is it arrives
+// as nvarchar, the server converts the column to nvarchar to compare them, and
+// the comparison follows a collation instead of byte order.
+func (rc *RowCodec) DecodeValue(i int, v any) (any, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var back any
+	if err := dec.Decode(&back); err != nil {
+		return nil, err
+	}
+	return rc.decodeOne(i, back)
 }
 
 func (rc *RowCodec) decodeOne(i int, raw any) (any, error) {
