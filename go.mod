@@ -1,6 +1,6 @@
 module github.com/JeePeeTee/dbdumper
 
-go 1.26.5
+go 1.26.8
 
 require github.com/microsoft/go-mssqldb v1.11.0
 
